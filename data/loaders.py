@@ -28,17 +28,12 @@ class ColumnMappingError(Exception):
     """Не удалось сопоставить обязательные колонки."""
 
 
-def _pick_sheet_name(path: Path, engine: str | None = "openpyxl") -> str | int:
+def _pick_sheet_name(xl: "pd.ExcelFile") -> str | int:
     """
-    Выбирает лист для загрузки.
+    Выбирает лист для загрузки из уже открытого файла.
     Приоритет: «Данные» (шаблон) → первый лист.
     Лист «Инструкция» никогда не читается как таблица данных.
     """
-    try:
-        xl = pd.ExcelFile(path, engine=engine)
-    except Exception:
-        xl = pd.ExcelFile(path)
-
     names = list(xl.sheet_names)
     for preferred in ("Данные", "Данные ", "Data", "data"):
         for name in names:
@@ -52,22 +47,54 @@ def _pick_sheet_name(path: Path, engine: str | None = "openpyxl") -> str | int:
     return 0
 
 
+# Порядок движков чтения Excel:
+#   openpyxl  — основной для .xlsx;
+#   calamine  — устойчивый резерв для нестандартных выгрузок из 1С
+#               (в т.ч. с перепутанными путями/регистром внутри архива,
+#               а также .xls / .xlsb / .ods);
+#   xlrd      — старые .xls, если calamine недоступен.
+_EXCEL_ENGINES: Tuple[Optional[str], ...] = ("openpyxl", "calamine", "xlrd")
+
+
+def _open_excel_file(path: Path) -> Tuple[Optional[str], "pd.ExcelFile"]:
+    """
+    Открывает Excel, перебирая движки по очереди.
+    Возвращает (engine, ExcelFile). Если ни один движок не справился —
+    бросает понятную ошибку (частый случай — «битая»/нестандартная выгрузка 1С).
+    """
+    errors: List[str] = []
+    for engine in _EXCEL_ENGINES:
+        try:
+            xl = pd.ExcelFile(path, engine=engine)
+            # Форсируем разбор структуры: ленивые движки падают именно здесь
+            _ = xl.sheet_names
+            logger.debug("Файл %s открыт движком %s", path.name, engine)
+            return engine, xl
+        except Exception as exc:  # перебираем движки, накапливаем причины
+            errors.append(f"{engine or 'auto'}: {exc}")
+
+    detail = "; ".join(errors)
+    raise ValueError(
+        f"Не удалось прочитать Excel-файл «{path.name}». "
+        "Похоже, файл повреждён или сохранён в нестандартном формате "
+        "(частая проблема выгрузок из 1С). Откройте его в Excel/LibreOffice "
+        "и пересохраните как «Книга Excel (*.xlsx)», затем загрузите снова.\n"
+        f"Технические детали: {detail}"
+    )
+
+
 def _read_excel_raw(path: Path) -> pd.DataFrame:
-    """Читает Excel с защитой от пустых/битых файлов."""
+    """Читает Excel с защитой от пустых/битых файлов; перебирает движки."""
     if not path.exists():
         raise FileNotFoundError(f"Файл не найден: {path}")
     if path.stat().st_size == 0:
         raise ValueError(f"Файл пустой: {path}")
 
-    # dtype=object — не теряем ведущие нули в артикулах и длинные названия
-    # Читаем лист «Данные», чтобы лист «Инструкция» в шаблоне не ломал загрузку
-    try:
-        sheet = _pick_sheet_name(path, engine="openpyxl")
-        df = pd.read_excel(path, sheet_name=sheet, engine="openpyxl", dtype=object)
-    except Exception:
-        # Старые .xls / запасной путь
-        sheet = _pick_sheet_name(path, engine=None)
-        df = pd.read_excel(path, sheet_name=sheet, dtype=object)
+    # dtype=object — не теряем ведущие нули в артикулах и длинные названия.
+    # Читаем лист «Данные», чтобы лист «Инструкция» в шаблоне не ломал загрузку.
+    _engine, xl = _open_excel_file(path)
+    sheet = _pick_sheet_name(xl)
+    df = pd.read_excel(xl, sheet_name=sheet, dtype=object)
 
     if df is None or df.empty:
         raise ValueError(
