@@ -1,5 +1,5 @@
 """
-Веб-интерфейс для менеджера по закупкам (Streamlit).
+Веб-интерфейс: прогноз заказа + калькулятор цен «Зеленое Яблоко» (Streamlit).
 
 Локальный запуск:
     streamlit run streamlit_app.py
@@ -17,7 +17,6 @@ from pathlib import Path
 
 import streamlit as st
 
-# Корень проекта в sys.path (и локально, и в облаке)
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -28,12 +27,14 @@ from data.loaders import detect_sales_date_range, load_sales_file, load_stock_fi
 from excel.workbook_builder import build_workbook
 from utils.helpers import ensure_output_dir
 from utils.logging_config import setup_logging
+from za_price_calculator.service import ZAPriceCalculator
+from za_price_calculator.exceptions import ZAPriceCalculatorError
 
 setup_logging()
 ensure_output_dir()
 
 st.set_page_config(
-    page_title="Прогноз заказа",
+    page_title="Инструменты закупщика",
     page_icon="📦",
     layout="centered",
 )
@@ -48,7 +49,11 @@ def _save_upload(uploaded_file) -> Path:
     return Path(tmp.name)
 
 
-def main() -> None:
+# ---------------------------------------------------------------------------
+# Tab 1 — Order forecast
+# ---------------------------------------------------------------------------
+
+def tab_forecast() -> None:
     st.title("Прогноз заказа")
     st.caption("Загрузите остатки и продажи из 1С → получите Excel с заказом, ABC и рисками")
 
@@ -239,6 +244,116 @@ def main() -> None:
     except Exception as exc:
         st.error(f"Ошибка расчёта: {exc}")
         st.exception(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tab 2 — Price calculator (ZA Price Calculator)
+# ---------------------------------------------------------------------------
+
+def tab_price_calculator() -> None:
+    st.title("Калькулятор цен «Зеленое Яблоко»")
+    st.caption(
+        "Загрузите прайс-лист → получите Excel с расчётом цен, наценки, маржи, "
+        "анализом конкурентов, Dashboard и Сценарным анализом"
+    )
+
+    with st.expander("📘 Как пользоваться", expanded=True):
+        st.markdown(
+            """
+**Что делает модуль.** По прайс-листу (закупочные цены + розничные цены ЗЯ + цены
+конкурентов) строит полный Excel-калькулятор с 6 листами: Инструкция, Исходные данные,
+Продажи, Расчеты (73 колонки), Dashboard, Сценарный анализ.
+
+**Порядок работы:**
+1. Загрузите **прайс-лист** (Excel). Обязательные колонки:
+   *Наименование*, *Закупочная цена*, *Розничная цена ЗЯ*.
+   Дополнительно: *Штрихкод*, цены конкурентов (7 Континент, Европейский, Тропики, Мята, Отличный,
+   Оптовик (молоток), Оптовик (редук)).
+2. Опционально загрузите **файл продаж** (колонки: Штрихкод, Кол-во продаж, Выручка, Валовая прибыль).
+   Без него калькулятор всё равно строится — продажи можно ввести вручную на листе «Расчеты».
+3. Нажмите **«Сформировать калькулятор»** и скачайте готовый файл.
+            """
+        )
+
+    with st.expander("📊 Листы итогового файла", expanded=False):
+        st.markdown(
+            """
+- **📋 Инструкция** — описание формул и правил работы с файлом.
+- **📊 Исходные данные** — Excel Table с загруженным прайс-листом.
+- **🛒 Продажи** — данные продаж (если загружены).
+- **🔢 Расчеты** — основной рабочий лист (73 колонки):
+  цены, наценка, маржа, 5 ценовых сценариев, моделирование продаж.
+- **📈 Dashboard** — KPI-карточки, топ-10 позиций, светофоры рисков.
+- **📋 Сценарный анализ** — сводная таблица по 5 сценариям + автосигналы.
+            """
+        )
+
+    st.subheader("1. Прайс-лист (обязательно)")
+    source_file = st.file_uploader(
+        "Выберите Excel с прайс-листом",
+        type=["xlsx", "xlsm", "xls"],
+        key="za_source",
+    )
+
+    st.subheader("2. Файл продаж (опционально)")
+    za_sales_file = st.file_uploader(
+        "Выберите Excel с продажами (необязательно)",
+        type=["xlsx", "xlsm", "xls"],
+        key="za_sales",
+    )
+
+    st.subheader("3. Запуск")
+    run = st.button("Сформировать калькулятор", type="primary", use_container_width=True, key="za_run")
+
+    if not run:
+        return
+
+    if source_file is None:
+        st.error("Загрузите прайс-лист.")
+        return
+
+    try:
+        with st.spinner("Строим калькулятор цен…"):
+            source_path = _save_upload(source_file)
+            sales_path = _save_upload(za_sales_file) if za_sales_file is not None else None
+
+            out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+            out_tmp.close()
+            out_path = Path(out_tmp.name)
+
+            calc = ZAPriceCalculator()
+            result_path = calc.run(
+                source_path=source_path,
+                output_path=out_path,
+                sales_path=sales_path,
+            )
+
+        st.success("Готово! Скачайте файл ниже.")
+        data = Path(result_path).read_bytes()
+        st.download_button(
+            label="⬇️ Скачать калькулятор Excel",
+            data=data,
+            file_name="ZA_Price_Calculator.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    except ZAPriceCalculatorError as exc:
+        st.error(f"Ошибка: {exc}")
+    except Exception as exc:
+        st.error(f"Непредвиденная ошибка: {exc}")
+        st.exception(exc)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    tab1, tab2 = st.tabs(["📦 Прогноз заказа", "💰 Калькулятор цен ЗЯ"])
+    with tab1:
+        tab_forecast()
+    with tab2:
+        tab_price_calculator()
 
 
 if __name__ == "__main__":
