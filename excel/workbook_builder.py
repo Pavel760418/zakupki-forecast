@@ -105,9 +105,16 @@ def build_workbook(
 ) -> Path:
     """Создаёт итоговый xlsx и возвращает путь.
 
-    supplier_name — опционально. Если передан, добавляется лист «09_Заказ_поставщику».
+    supplier_name — опционально (аргумент или meta['supplier_name']).
+    Если задан, добавляется лист «09_Заказ_поставщику».
     Без выбора поставщика структура книги остаётся прежней.
     """
+    # Имя поставщика: явный аргумент или значение из meta (Streamlit кладёт сюда).
+    resolved_supplier = safe_str(supplier_name).strip() if supplier_name else ""
+    if not resolved_supplier:
+        resolved_supplier = safe_str(meta.get("supplier_name", "")).strip()
+    resolved_supplier = resolved_supplier or None
+
     ensure_output_dir()
     if output_path is None:
         output_path = OUTPUT_DIR / timestamp_filename(SETTINGS["workbook_name_prefix"])
@@ -119,7 +126,7 @@ def build_workbook(
     default = wb.active
     wb.remove(default)
 
-    _build_instruction(wb, supplier_name=supplier_name)
+    _build_instruction(wb, supplier_name=resolved_supplier)
     _build_settings(wb, meta)
     _build_dashboard(wb, df, meta)
     _build_main_calc(wb, df, meta)
@@ -130,9 +137,9 @@ def build_workbook(
     _build_trends_sheet(wb, df)
 
     # Опциональный лист: только при явном выборе поставщика
-    if supplier_name and safe_str(supplier_name).strip():
+    if resolved_supplier:
         order_view = df[df["recommended_order"] > 0].copy() if "recommended_order" in df.columns else df
-        _build_supplier_order_sheet(wb, order_view, safe_str(supplier_name).strip())
+        _build_supplier_order_sheet(wb, order_view, resolved_supplier)
 
     wb.save(output_path)
     logger.info("Excel сохранён: %s", output_path)
