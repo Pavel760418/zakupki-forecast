@@ -1,5 +1,5 @@
 """
-Веб-интерфейс для менеджера по закупкам (Streamlit).
+Веб-интерфейс «Автозаказ СИКС» (Streamlit).
 
 Локальный запуск:
     streamlit run streamlit_app.py
@@ -25,6 +25,13 @@ if str(ROOT) not in sys.path:
 from calculations.pipeline import run_calculations
 from config.settings import SETTINGS
 from data.loaders import detect_sales_date_range, load_sales_file, load_stock_file
+from data.supplier_mapping import (
+    SUPPLIER_NONE_LABEL,
+    SupplierMappingError,
+    filter_frames_by_supplier,
+    get_cached_supplier_mapping,
+    list_suppliers,
+)
 from excel.workbook_builder import build_workbook
 from utils.helpers import ensure_output_dir
 from utils.logging_config import setup_logging
@@ -33,7 +40,7 @@ setup_logging()
 ensure_output_dir()
 
 st.set_page_config(
-    page_title="Прогноз заказа",
+    page_title="Автозаказ СИКС",
     page_icon="📦",
     layout="centered",
 )
@@ -48,20 +55,35 @@ def _save_upload(uploaded_file) -> Path:
     return Path(tmp.name)
 
 
+def _load_supplier_options() -> list[str]:
+    """Список поставщиков для UI. При ошибке — только общий режим."""
+    try:
+        suppliers = list_suppliers(get_cached_supplier_mapping())
+        return [SUPPLIER_NONE_LABEL, *suppliers]
+    except Exception as exc:
+        st.warning(
+            "Файл привязки SKU к поставщику недоступен. "
+            f"Доступен только общий расчёт. Детали: {exc}"
+        )
+        return [SUPPLIER_NONE_LABEL]
+
+
 def main() -> None:
-    st.title("Прогноз заказа — Второй релиз")
+    st.title("Автозаказ СИКС — Третий релиз")
     st.caption(
-        "Поддержка новых шаблонов выгрузки 1С: устойчивое чтение остатков и продаж "
-        "с автоопределением листа/заголовка и нормализацией структуры."
+        "Расчёт автозаказа по остаткам и продажам из 1С. "
+        "Выбор поставщика опционален: по умолчанию — общий расчёт по всей номенклатуре."
     )
 
     with st.expander("📘 Как пользоваться (пошагово)", expanded=True):
         st.markdown(
             """
-**Что нового во втором релизе.**
-- Добавлен новый слой чтения Excel для новых шаблонов 1С (продажи/остатки).
-- Поддерживаются служебные строки до таблицы, заголовок не в первой строке, merged cells, пустые строки и нестандартные названия листов.
-- Автоматически выполняется нормализация колонок и сопоставление ключей товаров.
+**Что нового в третьем релизе.**
+- Приложение называется **Автозаказ СИКС**.
+- Добавлена **опциональная** логика заказа в разрезе поставщика.
+- Привязка SKU → поставщик берётся из встроенного файла `Привязка_SKU_к_контрагенту.xlsx`.
+- Можно выбрать поставщика и получить отдельный лист **«09_Заказ_поставщику»** в итоговом Excel.
+- Если поставщик **не выбран**, приложение работает как раньше: общий расчёт по всей номенклатуре.
 
 **Что делает модуль.** По выгрузкам из 1С (остатки + продажи) он считает прогноз
 спроса и **рекомендуемый заказ** по каждой позиции, распределяет товары по классам
@@ -71,8 +93,14 @@ def main() -> None:
 1. Загрузите **файл остатков** (Excel из 1С): номенклатура/код/артикул, количество (остаток).
 2. Загрузите **файл продаж** (Excel из 1С): номенклатура/код/артикул, продажи (количество), даты.
 3. Проверьте **период расчёта** — он подставляется автоматически из файла продаж, при необходимости поправьте.
-4. Задайте **Горизонт заказа, дни** (на сколько дней закупаем) и **Коэффициент заказа** (общий множитель).
-5. Нажмите **«Сформировать Excel»** и скачайте готовый файл.
+4. Задайте **Горизонт заказа, дни** и **Коэффициент заказа**.
+5. *(Опционально)* выберите поставщика в блоке ниже — тогда в расчёт попадут только SKU этого поставщика.
+6. Нажмите **«Сформировать Excel»** и скачайте готовый файл.
+
+**Выбор поставщика — необязателен.**
+- Значение по умолчанию: **«Не выбран / общий расчёт»**.
+- Без выбора поставщика выполняется стандартный общий расчёт.
+- При выборе поставщика: фильтрация по привязке SKU → поставщик + лист «09_Заказ_поставщику».
 
 Модуль сам ищет подходящий лист и строку заголовка в выгрузке 1С.
 Если файл не читается — пересохраните его как «Книга Excel (*.xlsx)» и загрузите снова.
@@ -113,7 +141,8 @@ def main() -> None:
 
 **Листы:** `00_Инструкция`, `01_Настройки`, `02_Дашборд`,
 `03_Расчёт_заказа` (основной рабочий), `04_ABC`, `05_Риск_OOS`,
-`06_Неликвиды`, `07_Избыток`, `08_Тренды`.
+`06_Неликвиды`, `07_Избыток`, `08_Тренды`,
+`09_Заказ_поставщику` (только если выбран поставщик).
 
 **Цвет ячейки = правило:**
 - 🟨 **жёлтые — можно менять** (ручной ввод);
@@ -196,7 +225,30 @@ def main() -> None:
             step=0.1,
         )
 
-    st.subheader("4. Запуск")
+    st.subheader("4. Поставщик (опционально)")
+    st.caption(
+        "По умолчанию выполняется общий расчёт. Выбор поставщика не обязателен "
+        "и фильтрует только SKU, закреплённые за ним в файле привязки."
+    )
+    supplier_options = _load_supplier_options()
+    selected_supplier = st.selectbox(
+        "Поставщик для расчёта заказа",
+        options=supplier_options,
+        index=0,
+        key="supplier_select",
+        help="Оставьте «Не выбран / общий расчёт», чтобы посчитать всю номенклатуру.",
+    )
+    supplier_mode = (
+        selected_supplier
+        if selected_supplier and selected_supplier != SUPPLIER_NONE_LABEL
+        else None
+    )
+    if supplier_mode:
+        st.info(f"Режим: расчёт по поставщику **{supplier_mode}**")
+    else:
+        st.info("Режим: **общий расчёт** (без фильтра по поставщику)")
+
+    st.subheader("5. Запуск")
     run = st.button("Сформировать Excel", type="primary", use_container_width=True)
 
     if not run:
@@ -218,6 +270,13 @@ def main() -> None:
             stock_df = load_stock_file(stock_path)
             sales_df = load_sales_file(sales_path)
 
+            # Опциональная фильтрация: только при явном выборе поставщика
+            stock_df, sales_df, supplier_info = filter_frames_by_supplier(
+                stock_df,
+                sales_df,
+                supplier_mode,
+            )
+
             result_df, meta = run_calculations(
                 stock_df,
                 sales_df,
@@ -226,14 +285,25 @@ def main() -> None:
                 order_period_days=int(order_days),
                 order_coefficient=float(order_coef),
             )
-            out_path = build_workbook(result_df, meta)
+            if supplier_info.get("supplier_selected"):
+                meta["supplier_name"] = supplier_info.get("supplier_name", "")
+                meta["supplier_sku_keys"] = supplier_info.get("sku_keys", 0)
+
+            out_path = build_workbook(
+                result_df,
+                meta,
+                supplier_name=supplier_mode,
+            )
 
         st.success("Готово! Скачайте файл ниже.")
-        st.write(
+        summary = (
             f"Позиций: **{meta.get('items_count')}** · "
             f"К заказу: **{meta.get('order_lines')}** · "
             f"Рисков OOS: **{meta.get('oos_count')}**"
         )
+        if supplier_mode:
+            summary += f" · Поставщик: **{supplier_mode}**"
+        st.write(summary)
 
         data = Path(out_path).read_bytes()
         st.download_button(
@@ -243,6 +313,8 @@ def main() -> None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+    except SupplierMappingError as exc:
+        st.error(f"Ошибка режима по поставщику: {exc}")
     except Exception as exc:
         st.error(f"Ошибка расчёта: {exc}")
         st.exception(exc)

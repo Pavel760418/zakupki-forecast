@@ -58,7 +58,7 @@ SETTINGS = {
     "round_order_up": True,
 
     # --- Excel ---
-    "workbook_name_prefix": "Заказ_прогноз",
+    "workbook_name_prefix": "Автозаказ_СИКС",
     "freeze_header": True,
     "table_style": "TableStyleMedium2",
 
