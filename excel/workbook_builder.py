@@ -11,6 +11,7 @@
   06_Неликвиды
   07_Избыток
   08_Тренды
+  09_Заказ_поставщику  ← только при режиме «расчёт по поставщику»
 """
 
 from __future__ import annotations
@@ -120,6 +121,10 @@ def build_workbook(df: pd.DataFrame, meta: Dict[str, Any], output_path: str | Pa
     _build_filtered_sheet(wb, df[df["is_overstock"]], "07_Избыток", "Избыточные / завышенные запасы")
     _build_trends_sheet(wb, df)
 
+    # Релиз 3: лист заказа поставщику — только при явном режиме по поставщику
+    if meta.get("supplier_mode") and meta.get("supplier_name"):
+        _build_supplier_order_sheet(wb, df, meta)
+
     wb.save(output_path)
     logger.info("Excel сохранён: %s", output_path)
     return output_path
@@ -152,6 +157,12 @@ def _build_instruction(wb: Workbook) -> None:
         ("06_Неликвиды — нет продаж / зависший остаток.", False, 11),
         ("07_Избыток — завышенные запасы.", False, 11),
         ("08_Тренды — рост / спад спроса.", False, 11),
+        (
+            "09_Заказ_поставщику — формируется только при режиме «расчёт по поставщику» "
+            "(релиз 3). Содержит позиции выбранного поставщика к заказу.",
+            False,
+            11,
+        ),
         ("", False, 11),
         ("3. Что МОЖНО редактировать (жёлтые ячейки)", True, 13),
         ("На «01_Настройки»: дни периода продаж, дни периода заказа, коэф. заказа, uplift/downlift, safety stock, пороги.", False, 11),
@@ -693,3 +704,82 @@ def _build_trends_sheet(wb: Workbook, df: pd.DataFrame) -> None:
     ws.auto_filter.ref = f"A2:I{last}"
     ws.freeze_panes = "A3"
     autosize_columns(ws, name_col=2)
+
+
+def _build_supplier_order_sheet(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> None:
+    """
+    Лист «09_Заказ_поставщику» — только позиции выбранного поставщика.
+    Оформление в стиле остальных фильтрованных листов. Не создаётся без supplier_mode.
+    """
+    sheet_name = SETTINGS.get("supplier_order_sheet_name", "09_Заказ_поставщику")
+    supplier = safe_str(meta.get("supplier_name", ""))
+    ws = _ws(wb, sheet_name)
+    ws["A1"] = f"ЗАКАЗ ПОСТАВЩИКУ: {supplier}" if supplier else "ЗАКАЗ ПОСТАВЩИКУ"
+    ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill = FILL_HEADER
+    ws.merge_cells("A1:K1")
+
+    ws["A2"] = (
+        "Лист формируется только в режиме «расчёт по поставщику». "
+        "Показаны позиции с рекомендуемым заказом > 0 (и справочно — все SKU поставщика в расчёте)."
+    )
+    ws["A2"].alignment = ALIGN_WRAP
+    ws.merge_cells("A2:K2")
+    ws.row_dimensions[2].height = 32
+
+    titles = [
+        "Артикул",
+        "Наименование",
+        "Поставщик",
+        "ABC",
+        "Остаток",
+        "Продажи",
+        "Покрытие, дни",
+        "Рек. заказ",
+        "Статус",
+        "Риск",
+        "Светофор",
+    ]
+    for c, t in enumerate(titles, 1):
+        cell = ws.cell(row=3, column=c, value=t)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.border = THIN
+
+    # Сначала строки к заказу, затем остальные SKU поставщика (уже отфильтрованы в df)
+    order_df = df[df["recommended_order"] > 0].copy() if "recommended_order" in df.columns else df.copy()
+    if order_df.empty:
+        view = df.sort_values("priority") if "priority" in df.columns else df
+    else:
+        view = order_df.sort_values("priority") if "priority" in order_df.columns else order_df
+
+    for i, (_, row) in enumerate(view.iterrows(), start=4):
+        vals = [
+            row.get("sku", ""),
+            row.get("name", ""),
+            supplier,
+            row.get("abc_class", ""),
+            float(row.get("stock", 0) or 0),
+            float(row.get("sales_qty", 0) or 0),
+            round(float(row.get("cover_days", 0) or 0), 2),
+            float(row.get("recommended_order", 0) or 0),
+            row.get("status", ""),
+            row.get("risk_level", ""),
+            row.get("traffic_light", ""),
+        ]
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(row=i, column=c, value=v)
+            cell.border = THIN
+            if c == 2:
+                cell.alignment = ALIGN_WRAP
+            if c == 8 and isinstance(v, (int, float)) and v > 0:
+                cell.fill = FILL_FORMULA
+
+    last = max(3 + len(view), 3)
+    ws.auto_filter.ref = f"A3:K{last}"
+    ws.freeze_panes = "A4"
+    if view.empty:
+        ws["A4"] = "Нет позиций к заказу для выбранного поставщика."
+    autosize_columns(ws, name_col=2)
+    ws.column_dimensions["C"].width = 28
+

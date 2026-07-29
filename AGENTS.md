@@ -2,10 +2,13 @@
 
 ## Cursor Cloud specific instructions
 
-This repo is a Python purchase/procurement forecasting tool for 1С Корп Общепит.
+This repo is a Python purchase/procurement forecasting tool (**Автозаказ СИКС**)
+for 1С Корп Общепит.
 Offline Excel-in / Excel-out: upload a stock (`остатки`) file and a sales
 (`продажи`) file exported from 1C, get back a multi-sheet Excel workbook
-(order forecast, ABC analysis, OOS/dead-stock/overstock risks). There is no
+(order forecast, ABC analysis, OOS/dead-stock/overstock risks). Optionally
+filter the order by supplier using the bundled SKU↔контрагент mapping
+(`data/Привязка_SKU_к_контрагенту.xlsx`). There is no
 database, network, or external API — all processing is in-memory on the
 uploaded spreadsheets.
 

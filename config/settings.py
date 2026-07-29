@@ -11,7 +11,15 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
+# Встроенный файл привязки SKU → контрагент (релиз 3).
+# При наличии реального файла на Windows-пути loader найдёт его первым
+# только если путь явно задан; иначе используется файл в data/.
+DEFAULT_SUPPLIER_MAPPING_FILE = PROJECT_ROOT / "data" / "Привязка_SKU_к_контрагенту.xlsx"
+
 SETTINGS = {
+    # --- Привязка SKU к поставщику (опциональный режим расчёта) ---
+    "supplier_mapping_path": str(DEFAULT_SUPPLIER_MAPPING_FILE),
+    "supplier_order_sheet_name": "09_Заказ_поставщику",
     # --- Периоды (дни) ---
     "default_sales_period_days": 30,   # период анализа продаж
     "default_order_period_days": 14,   # горизонт заказа / покрытия

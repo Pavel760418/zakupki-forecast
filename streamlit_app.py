@@ -1,5 +1,5 @@
 """
-Веб-интерфейс для менеджера по закупкам (Streamlit).
+Веб-интерфейс «Автозаказ СИКС» (Streamlit).
 
 Локальный запуск:
     streamlit run streamlit_app.py
@@ -25,6 +25,10 @@ if str(ROOT) not in sys.path:
 from calculations.pipeline import run_calculations
 from config.settings import SETTINGS
 from data.loaders import detect_sales_date_range, load_sales_file, load_stock_file
+from data.supplier_mapping import (
+    filter_frames_by_supplier,
+    load_supplier_mapping,
+)
 from excel.workbook_builder import build_workbook
 from utils.helpers import ensure_output_dir
 from utils.logging_config import setup_logging
@@ -32,11 +36,17 @@ from utils.logging_config import setup_logging
 setup_logging()
 ensure_output_dir()
 
+APP_NAME = "Автозаказ СИКС"
+RELEASE_LABEL = "Третий релиз"
+
 st.set_page_config(
-    page_title="Прогноз заказа",
+    page_title=APP_NAME,
     page_icon="📦",
     layout="centered",
 )
+
+# Значение по умолчанию: общий расчёт без фильтра по поставщику
+SUPPLIER_NONE = "Не выбран / общий расчёт"
 
 
 def _save_upload(uploaded_file) -> Path:
@@ -48,20 +58,34 @@ def _save_upload(uploaded_file) -> Path:
     return Path(tmp.name)
 
 
+@st.cache_resource(show_spinner=False)
+def _cached_supplier_mapping():
+    """Загрузка привязки SKU→поставщик один раз за сессию процесса."""
+    return load_supplier_mapping()
+
+
 def main() -> None:
-    st.title("Прогноз заказа — Второй релиз")
+    st.title(f"{APP_NAME} — {RELEASE_LABEL}")
     st.caption(
-        "Поддержка новых шаблонов выгрузки 1С: устойчивое чтение остатков и продаж "
-        "с автоопределением листа/заголовка и нормализацией структуры."
+        "Прогноз автозаказа по выгрузкам 1С. Выбор поставщика — опционально: "
+        "по умолчанию выполняется общий расчёт по всей номенклатуре."
     )
 
     with st.expander("📘 Как пользоваться (пошагово)", expanded=True):
         st.markdown(
-            """
-**Что нового во втором релизе.**
-- Добавлен новый слой чтения Excel для новых шаблонов 1С (продажи/остатки).
-- Поддерживаются служебные строки до таблицы, заголовок не в первой строке, merged cells, пустые строки и нестандартные названия листов.
-- Автоматически выполняется нормализация колонок и сопоставление ключей товаров.
+            f"""
+**Что нового в третьем релизе ({APP_NAME}).**
+- Добавлен постоянный слой привязки **SKU → поставщик/контрагент**.
+- Можно **опционально** сформировать заказ **в разрезе выбранного поставщика**.
+- В итоговом Excel при расчёте по поставщику появляется лист **«09_Заказ_поставщику»**.
+- Если поставщик **не выбран**, приложение работает как раньше — **общий расчёт** по всей номенклатуре.
+
+**Выбор поставщика необязателен.**
+- Режим по умолчанию: **«Не выбран / общий расчёт»**.
+- Фильтрация SKU по поставщику включается **только** если вы явно выбрали поставщика
+  и запустили расчёт.
+- Привязка SKU берётся из встроенного файла `data/Привязка_SKU_к_контрагенту.xlsx`
+  (исходный файл привязки с рабочей станции).
 
 **Что делает модуль.** По выгрузкам из 1С (остатки + продажи) он считает прогноз
 спроса и **рекомендуемый заказ** по каждой позиции, распределяет товары по классам
@@ -72,7 +96,9 @@ def main() -> None:
 2. Загрузите **файл продаж** (Excel из 1С): номенклатура/код/артикул, продажи (количество), даты.
 3. Проверьте **период расчёта** — он подставляется автоматически из файла продаж, при необходимости поправьте.
 4. Задайте **Горизонт заказа, дни** (на сколько дней закупаем) и **Коэффициент заказа** (общий множитель).
-5. Нажмите **«Сформировать Excel»** и скачайте готовый файл.
+5. *(Опционально)* В блоке **«Режим расчёта»** выберите поставщика — тогда в расчёт попадут
+   только SKU, закреплённые за ним. Или оставьте «Не выбран / общий расчёт».
+6. Нажмите **«Сформировать Excel»** и скачайте готовый файл.
 
 Модуль сам ищет подходящий лист и строку заголовка в выгрузке 1С.
 Если файл не читается — пересохраните его как «Книга Excel (*.xlsx)» и загрузите снова.
@@ -102,6 +128,9 @@ def main() -> None:
 - 🟣 Неликвид — нет продаж при наличии остатка
 - 🔵 Приоритет A — важная позиция к заказу
 - 🟢 Норма / рост — плановый заказ; ⚪ запас достаточен
+
+**Режим по поставщику (релиз 3):** формулы те же; меняется только набор SKU —
+в расчёт попадают позиции, закреплённые за выбранным контрагентом в файле привязки.
             """
         )
 
@@ -113,7 +142,8 @@ def main() -> None:
 
 **Листы:** `00_Инструкция`, `01_Настройки`, `02_Дашборд`,
 `03_Расчёт_заказа` (основной рабочий), `04_ABC`, `05_Риск_OOS`,
-`06_Неликвиды`, `07_Избыток`, `08_Тренды`.
+`06_Неликвиды`, `07_Избыток`, `08_Тренды`,
+и при расчёте по поставщику — `09_Заказ_поставщику`.
 
 **Цвет ячейки = правило:**
 - 🟨 **жёлтые — можно менять** (ручной ввод);
@@ -196,7 +226,48 @@ def main() -> None:
             step=0.1,
         )
 
-    st.subheader("4. Запуск")
+    # --- Релиз 3: опциональный выбор поставщика ---
+    st.subheader("4. Режим расчёта (опционально)")
+    st.caption(
+        "По умолчанию — общий расчёт. Выбор поставщика не обязателен и не блокирует работу."
+    )
+
+    mapping_result = _cached_supplier_mapping()
+    supplier_options = [SUPPLIER_NONE]
+    if mapping_result.loaded and mapping_result.suppliers:
+        supplier_options.extend(mapping_result.suppliers)
+        st.caption(
+            f"Загружена привязка: {len(mapping_result.mapping)} SKU, "
+            f"{len(mapping_result.suppliers)} поставщиков"
+            + (
+                f" · неоднозначных SKU: {len(mapping_result.ambiguous_skus)}"
+                if mapping_result.ambiguous_skus
+                else ""
+            )
+        )
+    else:
+        for w in mapping_result.warnings:
+            st.info(w)
+        st.caption("Режим «по поставщику» станет доступен после появления файла привязки.")
+
+    selected_supplier = st.selectbox(
+        "Поставщик для заказа",
+        options=supplier_options,
+        index=0,
+        help=(
+            "Не выбран / общий расчёт — стандартный сценарий без фильтрации. "
+            "При выборе поставщика в расчёт попадут только закреплённые за ним SKU, "
+            "а в Excel появится лист «09_Заказ_поставщику»."
+        ),
+        key="supplier_select",
+    )
+    supplier_mode = (
+        selected_supplier != SUPPLIER_NONE
+        and bool(selected_supplier)
+        and mapping_result.loaded
+    )
+
+    st.subheader("5. Запуск")
     run = st.button("Сформировать Excel", type="primary", use_container_width=True)
 
     if not run:
@@ -218,6 +289,22 @@ def main() -> None:
             stock_df = load_stock_file(stock_path)
             sales_df = load_sales_file(sales_path)
 
+            supplier_filter_info = None
+            if supplier_mode:
+                stock_df, sales_df, supplier_filter_info = filter_frames_by_supplier(
+                    stock_df,
+                    sales_df,
+                    mapping_result.mapping,
+                    selected_supplier,
+                )
+                if stock_df.empty and sales_df.empty:
+                    st.error(
+                        f"По поставщику «{selected_supplier}» не найдено совпадающих SKU "
+                        "в загруженных остатках/продажах. Проверьте привязку или выберите "
+                        "«Не выбран / общий расчёт»."
+                    )
+                    return
+
             result_df, meta = run_calculations(
                 stock_df,
                 sales_df,
@@ -226,13 +313,29 @@ def main() -> None:
                 order_period_days=int(order_days),
                 order_coefficient=float(order_coef),
             )
+
+            if supplier_mode:
+                meta["supplier_mode"] = True
+                meta["supplier_name"] = selected_supplier
+                if supplier_filter_info:
+                    meta["supplier_filter"] = supplier_filter_info
+            else:
+                meta["supplier_mode"] = False
+                meta["supplier_name"] = ""
+
             out_path = build_workbook(result_df, meta)
 
+        mode_note = (
+            f" · Поставщик: **{selected_supplier}**"
+            if supplier_mode
+            else " · Режим: **общий расчёт**"
+        )
         st.success("Готово! Скачайте файл ниже.")
         st.write(
             f"Позиций: **{meta.get('items_count')}** · "
             f"К заказу: **{meta.get('order_lines')}** · "
             f"Рисков OOS: **{meta.get('oos_count')}**"
+            f"{mode_note}"
         )
 
         data = Path(out_path).read_bytes()
