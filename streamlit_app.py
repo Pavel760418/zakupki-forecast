@@ -289,11 +289,9 @@ def main() -> None:
                 meta["supplier_name"] = supplier_info.get("supplier_name", "")
                 meta["supplier_sku_keys"] = supplier_info.get("sku_keys", 0)
 
-            out_path = build_workbook(
-                result_df,
-                meta,
-                supplier_name=supplier_mode,
-            )
+            # Имя поставщика передаём через meta (см. build_workbook),
+            # без отдельного kwargs — совместимо со всеми версиями сборщика.
+            out_path = build_workbook(result_df, meta)
 
         st.success("Готово! Скачайте файл ниже.")
         summary = (
