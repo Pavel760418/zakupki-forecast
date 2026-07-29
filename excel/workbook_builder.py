@@ -97,8 +97,17 @@ HEADERS = [
 ]
 
 
-def build_workbook(df: pd.DataFrame, meta: Dict[str, Any], output_path: str | Path | None = None) -> Path:
-    """Создаёт итоговый xlsx и возвращает путь."""
+def build_workbook(
+    df: pd.DataFrame,
+    meta: Dict[str, Any],
+    output_path: str | Path | None = None,
+    supplier_name: str | None = None,
+) -> Path:
+    """Создаёт итоговый xlsx и возвращает путь.
+
+    supplier_name — опционально. Если передан, добавляется лист «09_Заказ_поставщику».
+    Без выбора поставщика структура книги остаётся прежней.
+    """
     ensure_output_dir()
     if output_path is None:
         output_path = OUTPUT_DIR / timestamp_filename(SETTINGS["workbook_name_prefix"])
@@ -110,7 +119,7 @@ def build_workbook(df: pd.DataFrame, meta: Dict[str, Any], output_path: str | Pa
     default = wb.active
     wb.remove(default)
 
-    _build_instruction(wb)
+    _build_instruction(wb, supplier_name=supplier_name)
     _build_settings(wb, meta)
     _build_dashboard(wb, df, meta)
     _build_main_calc(wb, df, meta)
@@ -119,6 +128,11 @@ def build_workbook(df: pd.DataFrame, meta: Dict[str, Any], output_path: str | Pa
     _build_filtered_sheet(wb, df[df["is_dead_stock"]], "06_Неликвиды", "Неликвиды и зависшие позиции")
     _build_filtered_sheet(wb, df[df["is_overstock"]], "07_Избыток", "Избыточные / завышенные запасы")
     _build_trends_sheet(wb, df)
+
+    # Опциональный лист: только при явном выборе поставщика
+    if supplier_name and safe_str(supplier_name).strip():
+        order_view = df[df["recommended_order"] > 0].copy() if "recommended_order" in df.columns else df
+        _build_supplier_order_sheet(wb, order_view, safe_str(supplier_name).strip())
 
     wb.save(output_path)
     logger.info("Excel сохранён: %s", output_path)
@@ -129,7 +143,7 @@ def _ws(wb: Workbook, title: str):
     return wb.create_sheet(title)
 
 
-def _build_instruction(wb: Workbook) -> None:
+def _build_instruction(wb: Workbook, supplier_name: str | None = None) -> None:
     ws = _ws(wb, "00_Инструкция")
     lines = [
         ("ИНСТРУКЦИЯ ДЛЯ ЗАКУПЩИКА", True, 16),
@@ -152,6 +166,22 @@ def _build_instruction(wb: Workbook) -> None:
         ("06_Неликвиды — нет продаж / зависший остаток.", False, 11),
         ("07_Избыток — завышенные запасы.", False, 11),
         ("08_Тренды — рост / спад спроса.", False, 11),
+        (
+            "09_Заказ_поставщику — заказ только по выбранному поставщику (появляется при режиме расчёта по поставщику).",
+            False,
+            11,
+        ),
+    ]
+    if supplier_name and safe_str(supplier_name).strip():
+        lines.append(
+            (
+                f"В этой книге выбран поставщик: {safe_str(supplier_name).strip()}.",
+                False,
+                11,
+            )
+        )
+    lines.extend(
+        [
         ("", False, 11),
         ("3. Что МОЖНО редактировать (жёлтые ячейки)", True, 13),
         ("На «01_Настройки»: дни периода продаж, дни периода заказа, коэф. заказа, uplift/downlift, safety stock, пороги.", False, 11),
@@ -191,7 +221,8 @@ def _build_instruction(wb: Workbook) -> None:
         ("Сначала отфильтруйте 🔴 и 🟠, затем класс A, затем остальное.", False, 11),
         ("Длинные наименования переносятся — увеличьте высоту строки при необходимости.", False, 11),
         ("Перед заказом в 1С сверьте единицы измерения и кратность упаковки вручную.", False, 11),
-    ]
+        ]
+    )
     ws.column_dimensions["A"].width = 120
     for i, (text, bold, size) in enumerate(lines, start=1):
         cell = ws.cell(row=i, column=1, value=text)
@@ -693,3 +724,72 @@ def _build_trends_sheet(wb: Workbook, df: pd.DataFrame) -> None:
     ws.auto_filter.ref = f"A2:I{last}"
     ws.freeze_panes = "A3"
     autosize_columns(ws, name_col=2)
+
+
+def _build_supplier_order_sheet(wb: Workbook, subset: pd.DataFrame, supplier_name: str) -> None:
+    """Лист заказа выбранному поставщику (только при опциональном режиме)."""
+    ws = _ws(wb, "09_Заказ_поставщику")
+    ws["A1"] = f"ЗАКАЗ ПОСТАВЩИКУ: {supplier_name}"
+    ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill = FILL_HEADER
+    ws.merge_cells("A1:K1")
+
+    ws["A2"] = (
+        "Лист формируется только при выбранном поставщике. "
+        "Показаны позиции с рекомендуемым заказом > 0."
+    )
+    ws["A2"].alignment = ALIGN_WRAP
+    ws.merge_cells("A2:K2")
+
+    titles = [
+        "№",
+        "Артикул",
+        "Наименование",
+        "ABC",
+        "Остаток",
+        "Продажи",
+        "Рек. заказ",
+        "Покрытие, дни",
+        "Статус",
+        "Риск",
+        "Ед.изм.",
+    ]
+    for c, t in enumerate(titles, 1):
+        cell = ws.cell(row=3, column=c, value=t)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.border = THIN
+
+    view = subset.sort_values(
+        ["recommended_order", "name"],
+        ascending=[False, True],
+    ) if not subset.empty and "recommended_order" in subset.columns else subset
+
+    for i, (_, row) in enumerate(view.iterrows(), start=4):
+        vals = [
+            i - 3,
+            row.get("sku", ""),
+            row.get("name", ""),
+            row.get("abc_class", ""),
+            float(row.get("stock", 0) or 0),
+            float(row.get("sales_qty", 0) or 0),
+            float(row.get("recommended_order", 0) or 0),
+            round(float(row.get("cover_days", 0) or 0), 2),
+            row.get("status", ""),
+            row.get("risk_level", ""),
+            row.get("uom", ""),
+        ]
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(row=i, column=c, value=v)
+            cell.border = THIN
+            if c == 3:
+                cell.alignment = ALIGN_WRAP
+            if c == 7:
+                cell.fill = FILL_EDIT
+
+    last = max(3 + len(view), 3)
+    ws.auto_filter.ref = f"A3:K{last}"
+    ws.freeze_panes = "A4"
+    if view.empty:
+        ws["A4"] = "По выбранному поставщику нет позиций с рекомендуемым заказом > 0."
+    autosize_columns(ws, name_col=3)

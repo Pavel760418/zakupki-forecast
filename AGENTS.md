@@ -21,6 +21,9 @@ uploaded spreadsheets.
   `utils/`, `gui/`, `samples/`), and every module imports via those package
   paths. Run entry points from the repo root so imports resolve. If you add a
   new module, put it in the correct package (do not flatten files into root).
+- Supplier mapping lives in `data/supplier_mapping.py` with the reference file
+  at `data/reference/Привязка_SKU_к_контрагенту.xlsx`. Supplier selection in
+  Streamlit is optional; default path is full assortment calculation.
 
 ### Services / entry points (all run from repo root)
 - Streamlit web app (primary): `streamlit run streamlit_app.py`

@@ -29,7 +29,7 @@ class WizardApp(ctk.CTk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("Прогноз заказа — 1С Корп Общепит")
+        self.title("Автозаказ СИКС — 1С Корп Общепит")
         self.geometry("720x520")
         self.minsize(640, 480)
 
@@ -45,7 +45,7 @@ class WizardApp(ctk.CTk):
     def _build_ui(self) -> None:
         self.header = ctk.CTkLabel(
             self,
-            text="Модуль прогноза закупок",
+            text="Автозаказ СИКС",
             font=ctk.CTkFont(size=22, weight="bold"),
         )
         self.header.pack(pady=(18, 4))
