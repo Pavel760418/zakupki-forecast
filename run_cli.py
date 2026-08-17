@@ -18,6 +18,8 @@ if str(ROOT) not in sys.path:
 
 from calculations.pipeline import run_calculations
 from data.loaders import load_sales_file, load_stock_file
+from data.merge import GRAIN_NETWORK, GRAIN_STORE
+from data.supplier_mapping import filter_frames_by_supplier
 from excel.workbook_builder import build_workbook
 from utils.helpers import ensure_output_dir
 from utils.logging_config import setup_logging
@@ -32,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--order-days", type=int, default=14, help="Горизонт заказа, дни")
     p.add_argument("--order-coef", type=float, default=1.0, help="Коэффициент заказа")
     p.add_argument("--out", default=None, help="Путь итогового xlsx")
+    p.add_argument("--by-store", action="store_true", help="Детализация по магазинам")
+    p.add_argument("--supplier", default=None, help="Имя поставщика (опционально)")
     return p.parse_args()
 
 
@@ -42,6 +46,7 @@ def main() -> int:
 
     stock = load_stock_file(args.stock)
     sales = load_sales_file(args.sales)
+    stock, sales, supplier_info = filter_frames_by_supplier(stock, sales, args.supplier)
     df, meta = run_calculations(
         stock,
         sales,
@@ -49,7 +54,10 @@ def main() -> int:
         args.date_to,
         order_period_days=args.order_days,
         order_coefficient=args.order_coef,
+        grain=GRAIN_STORE if args.by_store else GRAIN_NETWORK,
     )
+    if supplier_info.get("supplier_selected"):
+        meta["supplier_name"] = supplier_info.get("supplier_name", "")
     path = build_workbook(df, meta, args.out)
     print(f"OK: {path}")
     return 0

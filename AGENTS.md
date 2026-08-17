@@ -24,12 +24,15 @@ uploaded spreadsheets.
 - Supplier mapping lives in `data/supplier_mapping.py` with the reference file
   at `data/reference/Привязка_SKU_к_контрагенту.xlsx`. Supplier selection in
   Streamlit is optional; default path is full assortment calculation.
+- Store/warehouse grouping from 1C reports is normalized in `data/store_utils.py`.
+  Streamlit grain toggle: network (default) vs store. Rollback of release 3:
+  branch `cursor/backup-release-3-e9d7`, tag `release-3`.
 
 ### Services / entry points (all run from repo root)
 - Streamlit web app (primary): `streamlit run streamlit_app.py`
   (defaults to port 8501; use `--server.port <N>` to change). This is the
   best way to test end to end headlessly.
-- Headless CLI: `python run_cli.py --stock <xlsx> --sales <xlsx> --from DD.MM.YYYY --to DD.MM.YYYY --order-days 14 [--order-coef 1.0] [--out out.xlsx]`
+- Headless CLI: `python run_cli.py --stock <xlsx> --sales <xlsx> --from DD.MM.YYYY --to DD.MM.YYYY --order-days 14 [--order-coef 1.0] [--by-store] [--supplier NAME] [--out out.xlsx]`
 - Desktop GUI: `python main.py` — customtkinter/Tk window; requires a graphical
   display, so it is NOT runnable in a headless VM. Prefer Streamlit or the CLI.
 

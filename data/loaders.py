@@ -16,7 +16,7 @@ logger = logging.getLogger("zakupki_forecast.loaders")
 def load_stock_file(path: str | Path) -> pd.DataFrame:
     """
     Загружает файл остатков.
-    Возвращает DataFrame с колонками: sku, name, stock, uom, warehouse, sku_key.
+    Возвращает DataFrame: sku, name, stock, uom, store, barcode, sku_key.
     """
     path = Path(path)
     logger.info("Загрузка остатков: %s", path.name)
@@ -33,7 +33,7 @@ def load_stock_file(path: str | Path) -> pd.DataFrame:
 def load_sales_file(path: str | Path) -> pd.DataFrame:
     """
     Загружает файл продаж.
-    Возвращает DataFrame: sku, name, date, qty, amount, sku_key.
+    Возвращает DataFrame: sku, name, date, qty, amount, store, barcode, sku_key.
     """
     path = Path(path)
     logger.info("Загрузка продаж: %s", path.name)
