@@ -46,20 +46,33 @@ def run_calculations(
     order_coefficient: float | None = None,
     uplift_coefficient: float | None = None,
     downlift_coefficient: float | None = None,
+    allow_empty_sales: bool = False,
     grain: str = GRAIN_NETWORK,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Полный пайплайн:
     валидация → фильтр продаж → витрина → ABC → прогноз → заказ → риски.
+
+    allow_empty_sales=True — режим поставщика без продаж по его SKU:
+    расчёт идёт по ассортименту/остаткам (в т.ч. нулевым) без падения.
     grain: network (сводно) или store (по магазинам).
     """
-    validate_frames(stock, sales)
-    d1, d2, period_days = validate_period(
-        date_from,
-        date_to,
-        sales_min=sales["date"].min(),
-        sales_max=sales["date"].max(),
-    )
+    if allow_empty_sales and (sales is None or sales.empty):
+        sales = pd.DataFrame(columns=["sku", "name", "date", "qty", "amount", "sku_key"])
+        if stock is None or stock.empty:
+            raise ValueError("Таблица остатков пуста.")
+        for col in ("sku", "name", "stock", "sku_key"):
+            if col not in stock.columns:
+                raise ValueError(f"В остатках нет колонки: {col}")
+        d1, d2, period_days = validate_period(date_from, date_to)
+    else:
+        validate_frames(stock, sales)
+        d1, d2, period_days = validate_period(
+            date_from,
+            date_to,
+            sales_min=sales["date"].min(),
+            sales_max=sales["date"].max(),
+        )
     order_days = int(order_period_days or SETTINGS["default_order_period_days"])
 
     requested_grain = GRAIN_STORE if grain == GRAIN_STORE else GRAIN_NETWORK
@@ -110,6 +123,7 @@ def run_calculations(
             "order_coefficient": order_coefficient or SETTINGS["order_coefficient"],
             "uplift_coefficient": uplift_coefficient or SETTINGS["uplift_coefficient"],
             "downlift_coefficient": downlift_coefficient or SETTINGS["downlift_coefficient"],
+            "min_stock_target": SETTINGS.get("min_stock_target", 24),
             "abc_a_count": int((df["abc_class"] == "A").sum()),
             "abc_b_count": int((df["abc_class"] == "B").sum()),
             "abc_c_count": int((df["abc_class"] == "C").sum()),

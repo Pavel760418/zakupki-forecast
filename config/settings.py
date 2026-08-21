@@ -53,6 +53,10 @@ SETTINGS = {
     # --- Ограничения заказа ---
     "min_order_qty": 0,
     "max_order_multiplier": 5.0,      # заказ не больше N * прогноз без остатка
+    # Минимальный целевой остаток по каждому SKU (шт).
+    # Даже при нулевом остатке / низких продажах заказ докупается до этого уровня:
+    # recommended_order = max(расчётный_заказ, max(0, min_stock_target − stock)).
+    "min_stock_target": 24,
 
     # --- Округление ---
     "round_order_up": True,
