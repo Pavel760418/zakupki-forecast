@@ -13,7 +13,7 @@ from calculations.reorder import apply_reorder_logic
 from calculations.risk_analysis import apply_risk_analysis
 from config.settings import SETTINGS
 from data.merge import GRAIN_NETWORK, GRAIN_STORE, build_product_frame, filter_sales_by_period
-from data.store_utils import has_store_dimension
+from data.store_utils import has_retail_store_dimension, has_store_dimension
 from data.supplier_mapping import attach_supplier_attributes
 from data.validators import validate_frames, validate_period
 
@@ -77,12 +77,24 @@ def run_calculations(
 
     requested_grain = GRAIN_STORE if grain == GRAIN_STORE else GRAIN_NETWORK
     store_fallback = False
-    if requested_grain == GRAIN_STORE and not (
-        has_store_dimension(stock) and has_store_dimension(sales)
-    ):
-        logger.warning("Нет магазинов сразу в остатках и продажах — откат на сводный расчёт")
-        requested_grain = GRAIN_NETWORK
-        store_fallback = True
+    stock_no_retail = False
+    sales_has_stores = has_store_dimension(sales)
+    stock_has_stores = has_store_dimension(stock)
+    stock_has_retail = has_retail_store_dimension(stock)
+
+    if requested_grain == GRAIN_STORE:
+        # Достаточно магазинов в продажах ИЛИ в остатках.
+        # Типичный кейс 1С: продажи по подразделениям, остатки только «Склад основной1».
+        if not sales_has_stores and not stock_has_stores:
+            logger.warning("Нет магазинов ни в остатках, ни в продажах — откат на сводный расчёт")
+            requested_grain = GRAIN_NETWORK
+            store_fallback = True
+        elif sales_has_stores and not stock_has_retail:
+            stock_no_retail = True
+            logger.info(
+                "Магазины взяты из продаж; в остатках нет розничных точек "
+                "(часто только центральный склад) — grain=store без разноски остатков"
+            )
 
     sales_period = filter_sales_by_period(sales, d1, d2)
     base, meta = build_product_frame(stock, sales_period, d1, d2, grain=requested_grain)
@@ -135,6 +147,9 @@ def run_calculations(
             "order_sum_total": float(df["order_sum"].sum()),
             "grain": requested_grain,
             "store_grain_fallback": store_fallback,
+            "stock_no_retail_stores": stock_no_retail,
+            "sales_has_stores": sales_has_stores,
+            "stock_has_stores": stock_has_stores,
             "release": "4",
         }
     )

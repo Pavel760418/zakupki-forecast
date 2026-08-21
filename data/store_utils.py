@@ -9,6 +9,15 @@ from utils.helpers import safe_str
 NETWORK_STORE_LABEL = "Сводно по сети"
 UNKNOWN_STORE_LABEL = "Без магазина"
 
+# Центральный склад (не розничная точка) — в отчётах 1С часто единственный в остатках
+CENTRAL_WAREHOUSE_KEYS = frozenset(
+    {
+        "склад основной1",
+        "склад основной",
+        "сикса",
+    }
+)
+
 # Короткие имена сети СИКС → канон (как в остатках)
 STORE_CANON = {
     "адлер": "Адлер",
@@ -61,12 +70,34 @@ def store_key(value: object) -> str:
     return name.casefold() if name else ""
 
 
+def is_central_warehouse(value: object) -> bool:
+    """Центральный склад сети (не Адлер/Флагман/Сочи…)."""
+    key = store_key(value) or _norm_key(value)
+    return bool(key) and key in CENTRAL_WAREHOUSE_KEYS
+
+
 def has_store_dimension(frame) -> bool:
-    """Есть ли в канонической таблице непустые магазины."""
+    """Есть ли в канонической таблице непустые магазины/склады."""
     if frame is None or getattr(frame, "empty", True):
         return False
-    if "store" not in frame.columns:
+    if "store" not in frame.columns and "warehouse" not in frame.columns:
         return False
-    values = frame["store"].fillna("").map(lambda x: safe_str(x).strip())
+    if "store" in frame.columns:
+        values = frame["store"].fillna("").map(lambda x: safe_str(x).strip())
+    else:
+        values = frame["warehouse"].fillna("").map(lambda x: safe_str(canon_store_name(x)).strip())
     values = values[~values.isin({"", NETWORK_STORE_LABEL, UNKNOWN_STORE_LABEL})]
+    return bool(len(values))
+
+
+def has_retail_store_dimension(frame) -> bool:
+    """Есть ли розничные точки (без центрального склада и служебных меток)."""
+    if frame is None or getattr(frame, "empty", True):
+        return False
+    col = "store" if "store" in frame.columns else ("warehouse" if "warehouse" in frame.columns else "")
+    if not col:
+        return False
+    values = frame[col].fillna("").map(lambda x: safe_str(canon_store_name(x) if col == "warehouse" else x).strip())
+    values = values[~values.isin({"", NETWORK_STORE_LABEL, UNKNOWN_STORE_LABEL})]
+    values = values[~values.map(is_central_warehouse)]
     return bool(len(values))

@@ -288,7 +288,20 @@ def _supplier_catalog_rows(
     """Ассортимент поставщика из справочника в каноническом формате остатков."""
     part = mapping.frame[mapping.frame["supplier_name"] == supplier_name].copy()
     if part.empty:
-        return pd.DataFrame(columns=["sku", "name", "stock", "uom", "warehouse", "sku_key"])
+        return pd.DataFrame(
+            columns=[
+                "sku",
+                "name",
+                "stock",
+                "uom",
+                "warehouse",
+                "store",
+                "store_key",
+                "stock_amount",
+                "barcode",
+                "sku_key",
+            ]
+        )
 
     rows: List[Dict[str, object]] = []
     for _, row in part.iterrows():
@@ -307,13 +320,30 @@ def _supplier_catalog_rows(
                 "stock": 0.0,
                 "uom": "",
                 "warehouse": "",
+                "store": "",
+                "store_key": "",
+                "stock_amount": 0.0,
+                "barcode": "",
                 "sku_key": sku_key,
                 "alt_keys": {k for k in (sku_key, code_key, article_key, barcode_key) if k},
             }
         )
 
     if not rows:
-        return pd.DataFrame(columns=["sku", "name", "stock", "uom", "warehouse", "sku_key"])
+        return pd.DataFrame(
+            columns=[
+                "sku",
+                "name",
+                "stock",
+                "uom",
+                "warehouse",
+                "store",
+                "store_key",
+                "stock_amount",
+                "barcode",
+                "sku_key",
+            ]
+        )
 
     # Схлопываем дубли по основному sku_key.
     merged: Dict[str, Dict[str, object]] = {}
@@ -339,6 +369,10 @@ def _supplier_catalog_rows(
                 "stock": 0.0,
                 "uom": "",
                 "warehouse": "",
+                "store": "",
+                "store_key": "",
+                "stock_amount": 0.0,
+                "barcode": "",
                 "sku_key": v["sku_key"],
                 "alt_keys": v.get("alt_keys") or {v["sku_key"]},
             }
@@ -399,30 +433,91 @@ def filter_frames_by_supplier(
 
     # База = весь ассортимент поставщика (stock=0), поверх — остатки из файла.
     stock_f = catalog.copy()
+    for col, default in (
+        ("store", ""),
+        ("store_key", ""),
+        ("warehouse", ""),
+        ("stock_amount", 0.0),
+        ("barcode", ""),
+    ):
+        if col not in stock_f.columns:
+            stock_f[col] = default
+
     if stock_in is not None and not stock_in.empty:
-        stock_by_key = {
-            safe_str(r["sku_key"]): r
-            for _, r in stock_in.iterrows()
-            if safe_str(r.get("sku_key"))
-        }
-        for idx, row in stock_f.iterrows():
-            alt_keys = set(row.get("alt_keys") or set()) | {safe_str(row.get("sku_key"))}
-            matched = None
-            for ak in alt_keys:
-                if ak in stock_by_key:
-                    matched = stock_by_key[ak]
-                    break
-            if matched is None:
+        # Если в остатках несколько точек на один SKU — берём все строки файла,
+        # а не одну строку справочника (иначе теряется разбивка по магазинам).
+        from data.store_utils import canon_store_name, store_key as make_store_key
+
+        stock_in = stock_in.copy()
+        if "store" not in stock_in.columns:
+            if "warehouse" in stock_in.columns:
+                stock_in["store"] = stock_in["warehouse"].map(canon_store_name)
+            else:
+                stock_in["store"] = ""
+        else:
+            stock_in["store"] = stock_in["store"].map(
+                lambda x: canon_store_name(x) if safe_str(x).strip() else ""
+            )
+        stock_in["store_key"] = stock_in["store"].map(make_store_key)
+        if "warehouse" not in stock_in.columns:
+            stock_in["warehouse"] = stock_in["store"]
+        if "stock_amount" not in stock_in.columns:
+            stock_in["stock_amount"] = 0.0
+        if "barcode" not in stock_in.columns:
+            stock_in["barcode"] = ""
+
+        # Индекс справочника: любой alt_key → строка catalog
+        catalog_by_key: Dict[str, Dict[str, object]] = {}
+        for _, row in stock_f.iterrows():
+            payload = row.to_dict()
+            for ak in set(payload.get("alt_keys") or set()) | {safe_str(payload.get("sku_key"))}:
+                if ak and ak not in catalog_by_key:
+                    catalog_by_key[ak] = payload
+
+        matched_keys: set[str] = set()
+        overlay_rows: List[Dict[str, object]] = []
+        for _, src in stock_in.iterrows():
+            sku_k = safe_str(src.get("sku_key"))
+            hit = catalog_by_key.get(sku_k)
+            if hit is None:
                 continue
-            stock_f.at[idx, "stock"] = float(matched.get("stock", 0) or 0)
-            src_name = safe_str(matched.get("name"))
-            if src_name and len(src_name) >= len(safe_str(row.get("name"))):
-                stock_f.at[idx, "name"] = src_name
-            src_sku = safe_str(matched.get("sku"))
-            if src_sku:
-                stock_f.at[idx, "sku"] = src_sku
-            stock_f.at[idx, "uom"] = safe_str(matched.get("uom"))
-            stock_f.at[idx, "warehouse"] = safe_str(matched.get("warehouse"))
+            matched_keys.add(safe_str(hit.get("sku_key")))
+            store_name = safe_str(src.get("store")) or safe_str(src.get("warehouse"))
+            overlay_rows.append(
+                {
+                    "sku": safe_str(src.get("sku")) or safe_str(hit.get("sku")),
+                    "name": safe_str(src.get("name")) or safe_str(hit.get("name")),
+                    "stock": float(src.get("stock", 0) or 0),
+                    "uom": safe_str(src.get("uom")) or safe_str(hit.get("uom")),
+                    "warehouse": store_name,
+                    "store": store_name,
+                    "store_key": make_store_key(store_name),
+                    "stock_amount": float(src.get("stock_amount", 0) or 0),
+                    "barcode": safe_str(src.get("barcode")) or safe_str(hit.get("barcode")),
+                    "sku_key": safe_str(hit.get("sku_key")) or sku_k,
+                }
+            )
+
+        # SKU поставщика без строк в файле остатков — оставляем с нулём.
+        for _, row in stock_f.iterrows():
+            key = safe_str(row.get("sku_key"))
+            if key in matched_keys:
+                continue
+            overlay_rows.append(
+                {
+                    "sku": safe_str(row.get("sku")),
+                    "name": safe_str(row.get("name")),
+                    "stock": 0.0,
+                    "uom": safe_str(row.get("uom")),
+                    "warehouse": "",
+                    "store": "",
+                    "store_key": "",
+                    "stock_amount": 0.0,
+                    "barcode": safe_str(row.get("barcode")),
+                    "sku_key": key,
+                }
+            )
+        stock_f = pd.DataFrame(overlay_rows)
 
     # В расчётный pipeline не передаём служебную колонку alt_keys.
     if "alt_keys" in stock_f.columns:
