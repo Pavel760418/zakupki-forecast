@@ -55,17 +55,11 @@ def _save_upload(uploaded_file) -> Path:
     return Path(tmp.name)
 
 
+@st.cache_data(show_spinner=False)
 def _load_supplier_options() -> list[str]:
-    """Список поставщиков для UI. При ошибке — только общий режим."""
-    try:
-        suppliers = list_suppliers(get_cached_supplier_mapping())
-        return [SUPPLIER_NONE_LABEL, *suppliers]
-    except Exception as exc:
-        st.warning(
-            "Файл привязки SKU к поставщику недоступен. "
-            f"Доступен только общий расчёт. Детали: {exc}"
-        )
-        return [SUPPLIER_NONE_LABEL]
+    """Полный список поставщиков для UI (кэш Streamlit)."""
+    mapping = get_cached_supplier_mapping()
+    return [SUPPLIER_NONE_LABEL, *list_suppliers(mapping)]
 
 
 def main() -> None:
@@ -84,6 +78,8 @@ def main() -> None:
 - Привязка SKU → поставщик берётся из встроенного файла `Привязка_SKU_к_контрагенту.xlsx`.
 - Можно выбрать поставщика и получить отдельный лист **«09_Заказ_поставщику»** в итоговом Excel.
 - Если поставщик **не выбран**, приложение работает как раньше: общий расчёт по всей номенклатуре.
+- Для каждого SKU действует **минимальный остаток 24 шт**: даже при нулевом остатке или низких продажах заказ докупается до 24.
+- Расчёт по поставщику выполняется и **без остатков в файле**: отсутствующие SKU берутся из привязки с остатком 0.
 
 **Что делает модуль.** По выгрузкам из 1С (остатки + продажи) он считает прогноз
 спроса и **рекомендуемый заказ** по каждой позиции, распределяет товары по классам
@@ -101,6 +97,8 @@ def main() -> None:
 - Значение по умолчанию: **«Не выбран / общий расчёт»**.
 - Без выбора поставщика выполняется стандартный общий расчёт.
 - При выборе поставщика: фильтрация по привязке SKU → поставщик + лист «09_Заказ_поставщику».
+- Список поставщиков строится **полностью** из файла привязки (включая строки с объединёнными ячейками).
+- Если в остатках нет SKU выбранного поставщика, они всё равно попадают в расчёт с остатком 0 и докупаются до минимума.
 
 Модуль сам ищет подходящий лист и строку заголовка в выгрузке 1С.
 Если файл не читается — пересохраните его как «Книга Excel (*.xlsx)» и загрузите снова.
@@ -228,9 +226,17 @@ def main() -> None:
     st.subheader("4. Поставщик (опционально)")
     st.caption(
         "По умолчанию выполняется общий расчёт. Выбор поставщика не обязателен "
-        "и фильтрует только SKU, закреплённые за ним в файле привязки."
+        "и фильтрует SKU по файлу привязки. Отсутствие остатков в файле не блокирует расчёт."
     )
-    supplier_options = _load_supplier_options()
+    try:
+        supplier_options = _load_supplier_options()
+        st.caption(f"В справочнике привязки: **{len(supplier_options) - 1}** поставщиков.")
+    except Exception as exc:
+        st.warning(
+            "Файл привязки SKU к поставщику недоступен. "
+            f"Доступен только общий расчёт. Детали: {exc}"
+        )
+        supplier_options = [SUPPLIER_NONE_LABEL]
     selected_supplier = st.selectbox(
         "Поставщик для расчёта заказа",
         options=supplier_options,
@@ -284,6 +290,7 @@ def main() -> None:
                 date_to.strftime("%d.%m.%Y"),
                 order_period_days=int(order_days),
                 order_coefficient=float(order_coef),
+                allow_empty_sales=bool(supplier_info.get("allow_empty_sales")),
             )
             if supplier_info.get("supplier_selected"):
                 meta["supplier_name"] = supplier_info.get("supplier_name", "")

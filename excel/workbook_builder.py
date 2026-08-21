@@ -214,8 +214,9 @@ def _build_instruction(wb: Workbook, supplier_name: str | None = None) -> None:
         ("Прогноз = Среднедневные × ДниЗаказа × Тренд × КоэфЗаказа × Uplift × Downlift × МножABC × КоэфСтроки", False, 11),
         ("Страховой = Среднедневные × ДниSafety(ABC) × Тренд", False, 11),
         ("Потребность = Прогноз + Страховой", False, 11),
-        ("Рекомендуемый заказ = МАКС(0; ОКВВЕРХ(Потребность − Остаток))", False, 11),
-        ("Для неликвидов без продаж заказ обнуляется (см. статус).", False, 11),
+        ("Рекомендуемый заказ = MAX(расчётный; MAX(0; МинОстаток - Остаток))", False, 11),
+        ("Минимальный остаток по умолчанию — 24 шт на каждый SKU (параметр на «01_Настройки»).", False, 11),
+        ("Для неликвидов без продаж расчётный заказ обнуляется, но докупка до минимального остатка сохраняется.", False, 11),
         ("", False, 11),
         ("9. Советы", True, 13),
         ("Сначала отфильтруйте 🔴 и 🟠, затем класс A, затем остальное.", False, 11),
@@ -264,8 +265,10 @@ def _build_settings(wb: Workbook, meta: Dict[str, Any]) -> None:
         (17, "Критический OOS, дни", SETTINGS["critical_oos_cover_days"], "Покрытие ниже = критично"),
         (18, "Порог избытка, дни", SETTINGS["overstock_cover_days"], "Покрытие выше = избыток"),
         (19, "Дни без продаж → неликвид", SETTINGS["dead_stock_days_no_sales"], "Критерий неликвида"),
-        (20, "Дата начала периода", str(meta.get("date_from", ""))[:10], "Информативно"),
-        (21, "Дата окончания периода", str(meta.get("date_to", ""))[:10], "Информативно"),
+        (20, "Минимальный остаток, шт", SETTINGS.get("min_stock_target", 24),
+         "Докупка заказа до этого уровня по каждому SKU (даже при нулевом остатке / низких продажах)"),
+        (21, "Дата начала периода", str(meta.get("date_from", ""))[:10], "Информативно"),
+        (22, "Дата окончания периода", str(meta.get("date_to", ""))[:10], "Информативно"),
     ]
 
     for r, a, b, c in rows:
@@ -277,7 +280,7 @@ def _build_settings(wb: Workbook, meta: Dict[str, Any]) -> None:
             for col in range(1, 4):
                 ws.cell(row=r, column=col).fill = FILL_HEADER
                 ws.cell(row=r, column=col).font = FONT_HEADER
-        elif r <= 19:
+        elif r <= 20:
             cell_b.fill = FILL_EDIT
             cell_b.comment = Comment(c, "Система", width=200, height=50)
 
@@ -285,10 +288,10 @@ def _build_settings(wb: Workbook, meta: Dict[str, Any]) -> None:
     ws.column_dimensions["B"].width = 18
     ws.column_dimensions["C"].width = 45
 
-    ws["A23"] = "Справка по формулам"
-    ws["A23"].font = Font(bold=True, size=12, color="1F4E79")
-    ws["A24"] = "Прогноз = (Продажи/B5)*B6*Тренд*B7*B8*B9*МножABC*КоэфСтроки"
-    ws["A25"] = "Заказ = МАКС(0; ОКВВЕРХ(Прогноз+Страховой−Остаток))"
+    ws["A24"] = "Справка по формулам"
+    ws["A24"].font = Font(bold=True, size=12, color="1F4E79")
+    ws["A25"] = "Прогноз = (Продажи/B5)*B6*Тренд*B7*B8*B9*МножABC*КоэфСтроки"
+    ws["A26"] = "Заказ = MAX(расчётный; MAX(0; B20 - Остаток)) - докупка до минимального остатка"
 
 
 def _build_dashboard(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> None:
@@ -489,11 +492,16 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         ws.cell(row=r, column=12, value=f"=J{r}+K{r}")
         # M: need - stock
         ws.cell(row=r, column=13, value=f"=L{r}-D{r}")
-        # N: recommended order (блок неликвидов: продажи=0 и тренд<=1 → 0)
+        # N: recommended order
+        # 1) базовый расчёт с блоком неликвида
+        # 2) докупка до минимального остатка B20 (даже при нулевых продажах)
         ws.cell(
             row=r,
             column=14,
-            value=f'=IF(AND(E{r}<=0,F{r}<=1),0,MAX(0,CEILING(M{r},1)))',
+            value=(
+                f'=MAX(IF(AND(E{r}<=0,F{r}<=1),0,MAX(0,CEILING(M{r},1))),'
+                f'MAX(0,CEILING(\'01_Настройки\'!$B$20-D{r},1)))'
+            ),
         )
         # O: cover days
         ws.cell(row=r, column=15, value=f"=IF(I{r}>0,D{r}/I{r},IF(D{r}>0,9999,0))")

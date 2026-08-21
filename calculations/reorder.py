@@ -90,21 +90,31 @@ def apply_reorder_logic(
 
     # Рекомендуемый заказ
     max_mult = SETTINGS["max_order_multiplier"]
+    min_stock_target = float(SETTINGS.get("min_stock_target", 0) or 0)
     orders = []
+    min_topups = []
     for _, row in out.iterrows():
+        stock = float(row.get("stock", 0) or 0)
+        min_gap = max(0.0, min_stock_target - stock) if min_stock_target > 0 else 0.0
         if row["order_blocked"]:
-            orders.append(0.0)
-            continue
-        qty = max(float(row["raw_order"]), float(SETTINGS["min_order_qty"]))
-        cap = float(row["forecast_adj"]) * max_mult if row["forecast_adj"] > 0 else qty
-        if cap > 0:
-            qty = min(qty, cap)
+            # Блок неликвида не отменяет правило минимального остатка.
+            qty = min_gap
+        else:
+            qty = max(float(row["raw_order"]), float(SETTINGS["min_order_qty"]))
+            cap = float(row["forecast_adj"]) * max_mult if row["forecast_adj"] > 0 else qty
+            if cap > 0:
+                qty = min(qty, cap)
+            # Докупка до минимального целевого остатка (даже при низких продажах).
+            qty = max(qty, min_gap)
         if SETTINGS["round_order_up"] and qty > 0:
             qty = float(math.ceil(qty))
         else:
             qty = max(0.0, round(qty, 3))
         orders.append(qty)
+        min_topups.append(min_gap)
 
+    out["min_stock_target"] = min_stock_target
+    out["min_stock_gap"] = min_topups
     out["recommended_order"] = orders
     out["order_need_flag"] = out["recommended_order"] > 0
     return out

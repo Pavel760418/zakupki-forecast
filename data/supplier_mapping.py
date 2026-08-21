@@ -115,7 +115,8 @@ def _pick_data_start(raw: pd.DataFrame, header_row: int, col_map: Dict[str, int]
         supplier = safe_str(raw.iat[r, supplier_idx]) if supplier_idx is not None else ""
         code = safe_str(raw.iat[r, code_idx]) if code_idx is not None else ""
         article = safe_str(raw.iat[r, article_idx]) if article_idx is not None else ""
-        if supplier and (code or article or name):
+        # После ffill поставщика достаточно номенклатуры/кода.
+        if (supplier or code or article) and (code or article or name):
             return r
     return header_row + 1
 
@@ -152,8 +153,13 @@ def load_supplier_mapping(path: str | Path | None = None) -> SupplierMappingResu
 
     data_start = _pick_data_start(raw, header_row, col_map)
     records: List[Dict[str, object]] = []
+    # Forward-fill поставщика: в выгрузке 1С значение часто только в merged-ячейке.
+    last_supplier = ""
     for r in range(data_start, len(raw)):
-        supplier = safe_str(raw.iat[r, col_map["supplier"]]).strip()
+        supplier_raw = safe_str(raw.iat[r, col_map["supplier"]]).strip()
+        if supplier_raw:
+            last_supplier = supplier_raw
+        supplier = last_supplier
         name = safe_str(raw.iat[r, col_map["name"]]).strip() if "name" in col_map else ""
         code = safe_str(raw.iat[r, col_map["code"]]).strip() if "code" in col_map else ""
         article = (
@@ -164,6 +170,9 @@ def load_supplier_mapping(path: str | Path | None = None) -> SupplierMappingResu
         )
         if not supplier:
             continue
+        if not (code or article or barcode or name):
+            continue
+        # Строки-заголовки групп без идентификатора товара пропускаем.
         if not (code or article or barcode):
             continue
         records.append(
@@ -237,7 +246,13 @@ def get_cached_supplier_mapping() -> SupplierMappingResult:
     return load_supplier_mapping()
 
 
+def clear_supplier_mapping_cache() -> None:
+    """Сброс кэша (для тестов / обновления справочника)."""
+    get_cached_supplier_mapping.cache_clear()
+
+
 def list_suppliers(mapping: Optional[SupplierMappingResult] = None) -> List[str]:
+    """Полный список поставщиков из справочника (после ffill)."""
     mapping = mapping or get_cached_supplier_mapping()
     return mapping.suppliers
 
@@ -261,6 +276,77 @@ def sku_keys_for_supplier(
     return keys
 
 
+def _supplier_catalog_rows(
+    supplier_name: str,
+    mapping: SupplierMappingResult,
+) -> pd.DataFrame:
+    """Ассортимент поставщика из справочника в каноническом формате остатков."""
+    part = mapping.frame[mapping.frame["supplier_name"] == supplier_name].copy()
+    if part.empty:
+        return pd.DataFrame(columns=["sku", "name", "stock", "uom", "warehouse", "sku_key"])
+
+    rows: List[Dict[str, object]] = []
+    for _, row in part.iterrows():
+        sku = safe_str(row.get("sku"))
+        code_key = safe_str(row.get("code_key"))
+        article_key = safe_str(row.get("article_key"))
+        barcode_key = safe_str(row.get("barcode_key"))
+        # Как в loaders: article → code → barcode → name
+        sku_key = article_key or code_key or barcode_key or normalize_text(sku)
+        if not sku_key:
+            continue
+        rows.append(
+            {
+                "sku": sku,
+                "name": safe_str(row.get("item_name")),
+                "stock": 0.0,
+                "uom": "",
+                "warehouse": "",
+                "sku_key": sku_key,
+                "alt_keys": {k for k in (sku_key, code_key, article_key, barcode_key) if k},
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["sku", "name", "stock", "uom", "warehouse", "sku_key"])
+
+    # Схлопываем дубли по основному sku_key.
+    merged: Dict[str, Dict[str, object]] = {}
+    for row in rows:
+        key = str(row["sku_key"])
+        if key not in merged:
+            merged[key] = row
+            continue
+        prev = merged[key]
+        prev_name = safe_str(prev.get("name"))
+        new_name = safe_str(row.get("name"))
+        if len(new_name) > len(prev_name):
+            prev["name"] = new_name
+        prev_alts = set(prev.get("alt_keys") or set())
+        prev_alts |= set(row.get("alt_keys") or set())
+        prev["alt_keys"] = prev_alts
+
+    out = pd.DataFrame(
+        [
+            {
+                "sku": v["sku"],
+                "name": v["name"],
+                "stock": 0.0,
+                "uom": "",
+                "warehouse": "",
+                "sku_key": v["sku_key"],
+                "alt_keys": v.get("alt_keys") or {v["sku_key"]},
+            }
+            for v in merged.values()
+        ]
+    )
+    return out.reset_index(drop=True)
+
+
+def _empty_sales_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=["sku", "name", "date", "qty", "amount", "sku_key"])
+
+
 def filter_frames_by_supplier(
     stock: pd.DataFrame,
     sales: pd.DataFrame,
@@ -271,6 +357,11 @@ def filter_frames_by_supplier(
     Опциональная фильтрация входных таблиц по поставщику.
 
     Если поставщик не выбран — возвращает исходные frame без изменений.
+
+    Если поставщик выбран:
+    - ассортимент строится по справочнику привязки (даже без строк в остатках);
+    - фактические остатки из файла накладываются поверх (нет в файле → 0);
+    - продажи фильтруются по SKU поставщика (могут быть пустыми).
     """
     supplier_name = safe_str(supplier_name).strip()
     info: Dict[str, object] = {
@@ -279,6 +370,7 @@ def filter_frames_by_supplier(
         "sku_keys": 0,
         "stock_rows": len(stock),
         "sales_rows": len(sales),
+        "allow_empty_sales": False,
     }
     if not supplier_name or supplier_name == SUPPLIER_NONE_LABEL:
         return stock, sales, info
@@ -290,8 +382,46 @@ def filter_frames_by_supplier(
             f"Для поставщика «{supplier_name}» не найдено ни одного SKU в файле привязки."
         )
 
-    stock_f = stock[stock["sku_key"].isin(keys)].copy()
-    sales_f = sales[sales["sku_key"].isin(keys)].copy()
+    catalog = _supplier_catalog_rows(supplier_name, mapping)
+    if catalog.empty:
+        raise SupplierMappingError(
+            f"Для поставщика «{supplier_name}» справочник привязки пуст."
+        )
+
+    # Фактические остатки по ключам поставщика.
+    stock_in = stock[stock["sku_key"].isin(keys)].copy() if not stock.empty else stock
+    sales_f = sales[sales["sku_key"].isin(keys)].copy() if not sales.empty else _empty_sales_frame()
+
+    # База = весь ассортимент поставщика (stock=0), поверх — остатки из файла.
+    stock_f = catalog.copy()
+    if stock_in is not None and not stock_in.empty:
+        stock_by_key = {
+            safe_str(r["sku_key"]): r
+            for _, r in stock_in.iterrows()
+            if safe_str(r.get("sku_key"))
+        }
+        for idx, row in stock_f.iterrows():
+            alt_keys = set(row.get("alt_keys") or set()) | {safe_str(row.get("sku_key"))}
+            matched = None
+            for ak in alt_keys:
+                if ak in stock_by_key:
+                    matched = stock_by_key[ak]
+                    break
+            if matched is None:
+                continue
+            stock_f.at[idx, "stock"] = float(matched.get("stock", 0) or 0)
+            src_name = safe_str(matched.get("name"))
+            if src_name and len(src_name) >= len(safe_str(row.get("name"))):
+                stock_f.at[idx, "name"] = src_name
+            src_sku = safe_str(matched.get("sku"))
+            if src_sku:
+                stock_f.at[idx, "sku"] = src_sku
+            stock_f.at[idx, "uom"] = safe_str(matched.get("uom"))
+            stock_f.at[idx, "warehouse"] = safe_str(matched.get("warehouse"))
+
+    # В расчётный pipeline не передаём служебную колонку alt_keys.
+    if "alt_keys" in stock_f.columns:
+        stock_f = stock_f.drop(columns=["alt_keys"])
     info.update(
         {
             "supplier_selected": True,
@@ -301,31 +431,16 @@ def filter_frames_by_supplier(
             "sales_rows": len(sales_f),
             "stock_before": len(stock),
             "sales_before": len(sales),
+            "stock_from_file": 0 if stock_in is None else len(stock_in),
+            "allow_empty_sales": bool(sales_f.empty),
         }
     )
 
-    if stock_f.empty and sales_f.empty:
-        raise SupplierMappingError(
-            f"По поставщику «{supplier_name}» нет совпадений SKU "
-            "ни в остатках, ни в продажах. Проверьте коды/артикулы."
-        )
-    if sales_f.empty:
-        raise SupplierMappingError(
-            f"По поставщику «{supplier_name}» в файле продаж нет совпадающих SKU. "
-            "Общий расчёт без фильтра доступен, если выбрать "
-            f"«{SUPPLIER_NONE_LABEL}»."
-        )
-    if stock_f.empty:
-        raise SupplierMappingError(
-            f"По поставщику «{supplier_name}» в файле остатков нет совпадающих SKU. "
-            "Общий расчёт без фильтра доступен, если выбрать "
-            f"«{SUPPLIER_NONE_LABEL}»."
-        )
-
     logger.info(
-        "Фильтр поставщика «%s»: stock %s→%s, sales %s→%s, keys=%s",
+        "Фильтр поставщика «%s»: catalog=%s, stock_file=%s→%s, sales %s→%s, keys=%s",
         supplier_name,
-        info["stock_before"],
+        len(catalog),
+        info["stock_from_file"],
         info["stock_rows"],
         info["sales_before"],
         info["sales_rows"],
