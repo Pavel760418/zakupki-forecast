@@ -55,35 +55,37 @@ COL = {
     "id": 1,
     "store": 2,
     "supplier": 3,
-    "sku": 4,
-    "name": 5,
-    "barcode": 6,
-    "uom": 7,
-    "quantum": 8,
-    "stock": 9,
-    "sales": 10,
-    "trend": 11,
-    "line_coef": 12,
-    "abc": 13,
-    "avg_daily": 14,
-    "forecast": 15,
-    "safety": 16,
-    "need": 17,
-    "raw_order": 18,
-    "rec_order": 19,
-    "cover": 20,
-    "status": 21,
-    "risk": 22,
-    "light": 23,
-    "price": 24,
-    "order_sum": 25,
-    "note": 26,
+    "alt_supplier": 4,
+    "sku": 5,
+    "name": 6,
+    "barcode": 7,
+    "uom": 8,
+    "quantum": 9,
+    "stock": 10,
+    "sales": 11,
+    "trend": 12,
+    "line_coef": 13,
+    "abc": 14,
+    "avg_daily": 15,
+    "forecast": 16,
+    "safety": 17,
+    "need": 18,
+    "raw_order": 19,
+    "rec_order": 20,
+    "cover": 21,
+    "status": 22,
+    "risk": 23,
+    "light": 24,
+    "price": 25,
+    "order_sum": 26,
+    "note": 27,
 }
 
 HEADERS = [
     "№",
     "Магазин",
     "Поставщик",
+    "Альтернативный поставщик",
     "Артикул",
     "Наименование",
     "Штрихкод",
@@ -367,11 +369,12 @@ def _build_dashboard(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         (9, "Класс A / B / C", f"{meta.get('abc_a_count', 0)} / {meta.get('abc_b_count', 0)} / {meta.get('abc_c_count', 0)}"),
         (10, "Период продаж, дни", meta.get("period_days", "")),
         (11, "Горизонт заказа, дни", meta.get("order_period_days", "")),
-        (12, "Продажи за период, ед.", round(meta.get("total_sales_qty", 0), 2)),
-        (13, "Текущий остаток, ед.", round(meta.get("total_stock", 0), 2)),
-        (14, "Детализация", "по магазинам" if meta.get("grain") == GRAIN_STORE else "сводно по сети"),
-        (15, "Магазинов в расчёте", meta.get("store_count", 0)),
-        (16, "Сумма заказа, ₽", round(meta.get("order_sum_total", 0), 2)),
+        (12, "Коэффициент заказа", round(float(meta.get("order_coefficient", 1.0) or 1.0), 3)),
+        (13, "Продажи за период, ед.", round(meta.get("total_sales_qty", 0), 2)),
+        (14, "Текущий остаток, ед.", round(meta.get("total_stock", 0), 2)),
+        (15, "Детализация", "по магазинам" if meta.get("grain") == GRAIN_STORE else "сводно по сети"),
+        (16, "Магазинов в расчёте", meta.get("store_count", 0)),
+        (17, "Сумма заказа, ₽", round(meta.get("order_sum_total", 0), 2)),
     ]
     ws["A2"] = "Показатель"
     ws["B2"] = "Значение"
@@ -383,16 +386,16 @@ def _build_dashboard(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         cell.fill = FILL_FORMULA
 
     # Топ приоритетов
-    ws["A15"] = "ТОП приоритетных позиций (критично / OOS / A)"
-    ws["A15"].font = Font(bold=True, size=12, color="1F4E79")
+    ws["A19"] = "ТОП приоритетных позиций (критично / OOS / A)"
+    ws["A19"].font = Font(bold=True, size=12, color="1F4E79")
     top = df.sort_values("priority").head(15)
     headers = ["Артикул", "Наименование", "ABC", "Остаток", "Заказ", "Статус", "Светофор"]
     for i, h in enumerate(headers, 1):
-        cell = ws.cell(row=16, column=i, value=h)
+        cell = ws.cell(row=20, column=i, value=h)
         cell.fill = FILL_HEADER
         cell.font = FONT_HEADER
         cell.border = THIN
-    for r_i, (_, row) in enumerate(top.iterrows(), start=17):
+    for r_i, (_, row) in enumerate(top.iterrows(), start=21):
         vals = [
             row["sku"],
             row["name"],
@@ -517,6 +520,7 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         COL["line_coef"]: "Локальный множитель строки",
         COL["abc"]: "Класс ABC (можно скорректировать)",
         COL["quantum"]: "Квант упаковки (шт). Заказ и перемещения округляются вверх до кванта.",
+        COL["alt_supplier"]: "Другой поставщик с той же / похожей позицией в справочнике привязки",
         COL["rec_order"]: "Итоговый заказ (формула + округление до кванта в модуле)",
         COL["price"]: "Цена приходная из справочника, можно поправить",
         COL["note"]: "Свободный комментарий",
@@ -542,6 +546,7 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         ws.cell(row=r, column=COL["id"], value=int(row["row_id"]))
         ws.cell(row=r, column=COL["store"], value=safe_str(row.get("store", NETWORK_STORE_LABEL)))
         ws.cell(row=r, column=COL["supplier"], value=safe_str(row.get("supplier_name", "")))
+        ws.cell(row=r, column=COL["alt_supplier"], value=safe_str(row.get("alt_supplier", "")))
         ws.cell(row=r, column=COL["sku"], value=safe_str(row["sku"]))
         name_cell = ws.cell(row=r, column=COL["name"], value=safe_str(row["name"]))
         name_cell.alignment = ALIGN_WRAP
@@ -622,7 +627,7 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
             COL["avg_daily"], COL["forecast"], COL["safety"], COL["need"], COL["raw_order"],
             COL["rec_order"], COL["cover"], COL["status"], COL["risk"], COL["light"], COL["order_sum"],
         }
-        wrap_cols = {COL["name"], COL["store"], COL["supplier"]}
+        wrap_cols = {COL["name"], COL["store"], COL["supplier"], COL["alt_supplier"]}
         for c in range(1, len(HEADERS) + 1):
             cell = ws.cell(row=r, column=c)
             cell.border = THIN
@@ -651,16 +656,23 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         add_abc_validation(ws, f"{abc_l}3:{abc_l}{last_row}")
         add_oos_conditional(ws, status_l, 3, last_row)
         add_order_highlight(ws, rec_l, 3, last_row)
+        ws.auto_filter.ref = f"A2:{get_column_letter(len(HEADERS))}{last_row}"
     else:
         ws.auto_filter.ref = f"A2:{get_column_letter(len(HEADERS))}{max(last_row, 2)}"
 
-    ws.freeze_panes = "F3"
-    ws.column_dimensions["E"].width = 55
-    ws.column_dimensions["B"].width = 22
-    ws.column_dimensions["C"].width = 28
+    ws.freeze_panes = "G3"
+    ws.column_dimensions[_col_letter("name")].width = 55
+    ws.column_dimensions[_col_letter("store")].width = 22
+    ws.column_dimensions[_col_letter("supplier")].width = 28
+    ws.column_dimensions[_col_letter("alt_supplier")].width = 32
     for col in range(1, len(HEADERS) + 1):
         letter = get_column_letter(col)
-        if letter in {"B", "C", "E"}:
+        if letter in {
+            _col_letter("name"),
+            _col_letter("store"),
+            _col_letter("supplier"),
+            _col_letter("alt_supplier"),
+        }:
             continue
         ws.column_dimensions[letter].width = 14 if col > 3 else 12
     ws.column_dimensions[_col_letter("status")].width = 28
@@ -869,7 +881,18 @@ def _build_supplier_order_sheet(
         titles.append("Магазин")
     if include_supplier:
         titles.append("Поставщик")
-    titles.extend(["Наименование", "Штрихкод", "Ед.", "Квант", "Заказ, кол-во", "Цена", "Сумма"])
+    titles.extend(
+        [
+            "Наименование",
+            "Штрихкод",
+            "Ед.",
+            "Квант",
+            "Заказ, кол-во",
+            "Цена",
+            "Сумма",
+            "Альтернативный поставщик",
+        ]
+    )
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(titles))
 
     ws["A2"] = (
@@ -881,6 +904,7 @@ def _build_supplier_order_sheet(
             if grain == GRAIN_STORE
             else ""
         )
+        + "Колонка «Альтернативный поставщик» — пересекающиеся позиции у других контрагентов. "
         + "Количество можно править — сумму пересчитайте как кол-во × цена."
     )
     ws["A2"].alignment = ALIGN_WRAP
@@ -925,19 +949,21 @@ def _build_supplier_order_sheet(
                 qty,
                 price,
                 amount,
+                safe_str(row.get("alt_supplier", "")),
             ]
         )
         r = n + 3
         name_idx = 1 + int(include_store) + int(include_supplier) + 1
-        # ... Квант, Заказ, Цена, Сумма
-        quantum_idx = len(titles) - 3
-        qty_idx = len(titles) - 2
-        price_idx = len(titles) - 1
-        sum_idx = len(titles)
+        # ... Квант, Заказ, Цена, Сумма, Альт.поставщик
+        quantum_idx = len(titles) - 4
+        qty_idx = len(titles) - 3
+        price_idx = len(titles) - 2
+        sum_idx = len(titles) - 1
+        alt_idx = len(titles)
         for c, v in enumerate(vals, 1):
             cell = ws.cell(row=r, column=c, value=v)
             cell.border = THIN
-            if c == name_idx:
+            if c == name_idx or c == alt_idx:
                 cell.alignment = ALIGN_WRAP
             if c == quantum_idx:
                 cell.fill = FILL_EDIT
@@ -957,8 +983,8 @@ def _build_supplier_order_sheet(
             ws.cell(row=tot, column=c).fill = FILL_HEADER
             ws.cell(row=tot, column=c).font = FONT_HEADER
             ws.cell(row=tot, column=c).border = THIN
-        ws.cell(row=tot, column=len(titles) - 2, value=total_qty)
-        sum_cell = ws.cell(row=tot, column=len(titles), value=round(total_sum, 2))
+        ws.cell(row=tot, column=len(titles) - 3, value=total_qty)
+        sum_cell = ws.cell(row=tot, column=len(titles) - 1, value=round(total_sum, 2))
         sum_cell.number_format = "#,##0.00"
         ws.auto_filter.ref = f"A3:{get_column_letter(len(titles))}{n + 3}"
         ws.freeze_panes = "A4"
@@ -985,12 +1011,22 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
             if safe_str(x) and not is_central_warehouse(x)
         }
     )
-    headers = ["Поставщик", "Наименование", "Штрихкод", "Квант"] + stores + ["Итого заказ", "Сумма, ₽"]
+    headers = [
+        "Поставщик",
+        "Альтернативный поставщик",
+        "Наименование",
+        "Штрихкод",
+        "Квант",
+    ] + stores + ["Итого заказ", "Сумма, ₽"]
     ws["A1"] = "ЗАКАЗ SKU × МАГАЗИН (кванты)"
     ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
     ws["A1"].fill = FILL_HEADER
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
-    ws["A2"] = "Количество в точках уже кратно кванту. Пустая ячейка = заказ 0. Центральный склад в матрицу не входит."
+    ws["A2"] = (
+        "Количество в точках уже кратно кванту. Пустая ячейка = заказ 0. "
+        "Центральный склад в матрицу не входит. "
+        "«Альтернативный поставщик» — пересечение номенклатуры у других контрагентов."
+    )
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
 
     for c, t in enumerate(headers, 1):
@@ -1007,6 +1043,7 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
             key,
             {
                 "supplier": safe_str(row.get("supplier_name", "")),
+                "alt_supplier": safe_str(row.get("alt_supplier", "")),
                 "name": safe_str(row.get("name", "")),
                 "barcode": safe_str(row.get("barcode", "")),
                 "quantum": int(row.get("quantum", 1) or 1),
@@ -1018,21 +1055,29 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
         qty = float(row.get("recommended_order", 0) or 0)
         if store in grouped[key]["qty"]:
             grouped[key]["qty"][store] += qty
+        if not grouped[key]["alt_supplier"] and safe_str(row.get("alt_supplier", "")):
+            grouped[key]["alt_supplier"] = safe_str(row.get("alt_supplier", ""))
 
     r = 4
     for item in sorted(grouped.values(), key=lambda x: (x["supplier"], x["name"])):
         total = sum(item["qty"].values())
-        vals = [item["supplier"], item["name"], item["barcode"], item["quantum"]]
+        vals = [
+            item["supplier"],
+            item["alt_supplier"],
+            item["name"],
+            item["barcode"],
+            item["quantum"],
+        ]
         vals.extend(item["qty"][s] or None for s in stores)
         vals.extend([total, round(total * item["price"], 2)])
         for c, v in enumerate(vals, 1):
             cell = ws.cell(row=r, column=c, value=v)
             cell.border = THIN
-            if c in (1, 2):
+            if c in (1, 2, 3):
                 cell.alignment = ALIGN_WRAP
-            if c == 4:
+            if c == 5:
                 cell.fill = FILL_EDIT
-            if 5 <= c <= 4 + len(stores) and v:
+            if 6 <= c <= 5 + len(stores) and v:
                 cell.fill = FILL_EDIT
             if c >= len(vals) - 1:
                 cell.fill = FILL_FORMULA
@@ -1040,11 +1085,12 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
                 cell.number_format = "#,##0.00"
         ws.row_dimensions[r].height = 28
         r += 1
-    ws.freeze_panes = "E4"
+    ws.freeze_panes = "F4"
     ws.column_dimensions["A"].width = 28
-    ws.column_dimensions["B"].width = 55
-    ws.column_dimensions["C"].width = 16
-    ws.column_dimensions["D"].width = 10
+    ws.column_dimensions["B"].width = 32
+    ws.column_dimensions["C"].width = 55
+    ws.column_dimensions["D"].width = 16
+    ws.column_dimensions["E"].width = 10
 
 
 def _build_transfer_sheet(
@@ -1078,6 +1124,7 @@ def _build_transfer_sheet(
         "Поставщик",
         "Цена",
         "Сумма (справка)",
+        "Альтернативный поставщик",
     ]
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(titles))
     ws["A2"] = (
@@ -1144,6 +1191,7 @@ def _build_transfer_sheet(
             safe_str(row.get("supplier_name", "")),
             price,
             amount,
+            safe_str(row.get("alt_supplier", "")),
         ]
         r = n + 3
         for c, v in enumerate(vals, 1):

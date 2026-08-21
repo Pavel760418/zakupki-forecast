@@ -184,9 +184,21 @@ def run_calculations(
     meta.update(
         {
             "order_period_days": order_days,
-            "order_coefficient": order_coefficient or SETTINGS["order_coefficient"],
-            "uplift_coefficient": uplift_coefficient or SETTINGS["uplift_coefficient"],
-            "downlift_coefficient": downlift_coefficient or SETTINGS["downlift_coefficient"],
+            "order_coefficient": (
+                float(order_coefficient)
+                if order_coefficient is not None
+                else float(SETTINGS["order_coefficient"])
+            ),
+            "uplift_coefficient": (
+                float(uplift_coefficient)
+                if uplift_coefficient is not None
+                else float(SETTINGS["uplift_coefficient"])
+            ),
+            "downlift_coefficient": (
+                float(downlift_coefficient)
+                if downlift_coefficient is not None
+                else float(SETTINGS["downlift_coefficient"])
+            ),
             "min_stock_target": SETTINGS.get("min_stock_target", 24),
             "abc_a_count": int((df["abc_class"] == "A").sum()),
             "abc_b_count": int((df["abc_class"] == "B").sum()),

@@ -74,6 +74,7 @@ def apply_central_warehouse_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, p
             "sales_qty",
             "supplier_name",
             "purchase_price",
+            "alt_supplier",
         ]
     )
 
@@ -172,6 +173,9 @@ def apply_central_warehouse_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, p
                         out.at[idx, "purchase_price"] if "purchase_price" in out.columns else 0
                     )
                     or 0.0,
+                    "alt_supplier": safe_str(
+                        out.at[idx, "alt_supplier"] if "alt_supplier" in out.columns else ""
+                    ),
                 }
             )
 
