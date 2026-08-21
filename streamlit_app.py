@@ -328,6 +328,12 @@ def main() -> None:
             max_value=5.0,
             value=float(SETTINGS["order_coefficient"]),
             step=0.1,
+            help=(
+                "Глобальный множитель прогноза и заказа. "
+                "Больше 1 — повышающий (акции/сезон), меньше 1 — понижающий. "
+                "Пишется в Excel «01_Настройки»!B7 и участвует в формулах листа 03."
+            ),
+            key="order_coef_input",
         )
 
     supplier_mode = _render_supplier_block()
@@ -387,6 +393,14 @@ def main() -> None:
             if supplier_info.get("supplier_selected"):
                 meta["supplier_name"] = supplier_info.get("supplier_name", "")
                 meta["supplier_sku_keys"] = supplier_info.get("sku_keys", 0)
+                overlap = supplier_info.get("overlap_suppliers") or []
+                if overlap:
+                    st.info(
+                        "В заказ добавлены пересекающиеся позиции альтернативных поставщиков: "
+                        f"**{', '.join(overlap)}** "
+                        f"(+{int(supplier_info.get('overlap_extra_skus', 0) or 0)} SKU). "
+                        "См. колонку **«Альтернативный поставщик»** на листах 03/09/10."
+                    )
             if meta.get("store_grain_fallback"):
                 st.warning(
                     "В загруженных файлах не найдены магазины/подразделения. "
@@ -445,7 +459,8 @@ def main() -> None:
         summary = (
             f"Позиций: **{meta.get('items_count')}** · "
             f"К заказу: **{meta.get('order_lines')}** · "
-            f"Рисков OOS: **{meta.get('oos_count')}**"
+            f"Рисков OOS: **{meta.get('oos_count')}** · "
+            f"Коэф. заказа: **{float(meta.get('order_coefficient', order_coef)):.2f}**"
         )
         if supplier_mode:
             summary += f" · Поставщик: **{supplier_mode}**"

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -254,12 +255,154 @@ def get_cached_supplier_mapping() -> SupplierMappingResult:
 def clear_supplier_mapping_cache() -> None:
     """Сброс кэша (для тестов / обновления справочника)."""
     get_cached_supplier_mapping.cache_clear()
+    clear_soft_overlap_cache()
 
 
 def list_suppliers(mapping: Optional[SupplierMappingResult] = None) -> List[str]:
     """Полный список поставщиков из справочника (после ffill)."""
     mapping = mapping or get_cached_supplier_mapping()
     return mapping.suppliers
+
+
+def soft_product_key(name: object) -> str:
+    """
+    Ключ аналога без фасовки/кванта — для поиска пересечений SKU у разных поставщиков.
+    Пример: «… Carbonara … 140г*40» и «… Carbonara … 105г» → один soft-ключ.
+    """
+    text = normalize_text(name)
+    if not text:
+        return ""
+    text = re.sub(r"[\s\*\/]+\d+\s*$", "", text)
+    text = re.sub(r"\d+\s*(?:г|гр|g|ml|мл|кг|шт)\b.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) >= 18 else ""
+
+
+@lru_cache(maxsize=1)
+def _cached_soft_overlap_index() -> Tuple[Dict[str, List[Dict[str, object]]], Dict[str, str]]:
+    """soft_key → записи; любой sku/code/article/barcode key → soft_key."""
+    mapping = get_cached_supplier_mapping()
+    soft_index: Dict[str, List[Dict[str, object]]] = {}
+    key_to_soft: Dict[str, str] = {}
+    for _, row in mapping.frame.iterrows():
+        supplier = safe_str(row.get("supplier_name"))
+        item_name = safe_str(row.get("item_name"))
+        soft = soft_product_key(item_name)
+        if not soft or not supplier:
+            continue
+        code_key = safe_str(row.get("code_key"))
+        article_key = safe_str(row.get("article_key"))
+        barcode_key = safe_str(row.get("barcode_key"))
+        sku = safe_str(row.get("sku"))
+        sku_key = article_key or code_key or barcode_key or normalize_text(sku)
+        if not sku_key:
+            continue
+        keys = {k for k in (sku_key, code_key, article_key, barcode_key) if k}
+        entry = {
+            "supplier": supplier,
+            "sku_key": sku_key,
+            "keys": keys,
+            "name": item_name,
+            "sku": sku,
+            "barcode": safe_str(row.get("barcode")),
+        }
+        soft_index.setdefault(soft, []).append(entry)
+        for k in keys:
+            key_to_soft.setdefault(k, soft)
+    return soft_index, key_to_soft
+
+
+def clear_soft_overlap_cache() -> None:
+    _cached_soft_overlap_index.cache_clear()
+
+
+def alternative_suppliers_for_row(
+    *,
+    sku_key: object = "",
+    name: object = "",
+    barcode: object = "",
+    current_supplier: object = "",
+) -> str:
+    """Другие поставщики с пересекающейся номенклатурой (через soft-ключ)."""
+    soft_index, key_to_soft = _cached_soft_overlap_index()
+    soft = ""
+    for cand in (
+        normalize_text(sku_key),
+        normalize_text(barcode),
+        soft_product_key(name),
+    ):
+        if not cand:
+            continue
+        soft = key_to_soft.get(cand) or (cand if cand in soft_index else soft)
+        if soft:
+            break
+    if not soft:
+        soft = soft_product_key(name)
+    if not soft or soft not in soft_index:
+        return ""
+    current = safe_str(current_supplier).strip()
+    others = sorted(
+        {
+            safe_str(e.get("supplier"))
+            for e in soft_index[soft]
+            if safe_str(e.get("supplier")) and safe_str(e.get("supplier")) != current
+        }
+    )
+    return "; ".join(others)
+
+
+def expand_keys_with_overlapping_suppliers(
+    supplier_name: str,
+    keys: Set[str],
+    mapping: SupplierMappingResult,
+) -> Tuple[Set[str], pd.DataFrame, List[str]]:
+    """
+    Расширяет набор SKU выбранного поставщика позициями аналогов у других контрагентов.
+    Возвращает (keys, extra_catalog_rows, имена альтернативных поставщиков).
+    """
+    soft_index, _ = _cached_soft_overlap_index()
+    part = mapping.frame[mapping.frame["supplier_name"] == supplier_name]
+    primary_soft: Set[str] = set()
+    for _, row in part.iterrows():
+        soft = soft_product_key(row.get("item_name"))
+        if soft:
+            primary_soft.add(soft)
+
+    expanded = set(keys)
+    alt_suppliers: Set[str] = set()
+    extra_rows: List[Dict[str, object]] = []
+    seen_sku: Set[str] = set(keys)
+
+    for soft in primary_soft:
+        for entry in soft_index.get(soft, []):
+            other = safe_str(entry.get("supplier"))
+            if other == supplier_name:
+                continue
+            alt_suppliers.add(other)
+            entry_keys = set(entry.get("keys") or set())
+            expanded |= entry_keys
+            sku_k = safe_str(entry.get("sku_key"))
+            if not sku_k or sku_k in seen_sku:
+                continue
+            seen_sku.add(sku_k)
+            extra_rows.append(
+                {
+                    "sku": safe_str(entry.get("sku")) or sku_k,
+                    "name": safe_str(entry.get("name")),
+                    "stock": 0.0,
+                    "uom": "",
+                    "warehouse": "",
+                    "store": "",
+                    "store_key": "",
+                    "stock_amount": 0.0,
+                    "barcode": safe_str(entry.get("barcode")),
+                    "sku_key": sku_k,
+                    "alt_keys": entry_keys | {sku_k},
+                }
+            )
+
+    extra_df = pd.DataFrame(extra_rows) if extra_rows else pd.DataFrame()
+    return expanded, extra_df, sorted(alt_suppliers)
 
 
 def sku_keys_for_supplier(
@@ -427,7 +570,16 @@ def filter_frames_by_supplier(
             f"Для поставщика «{supplier_name}» справочник привязки пуст."
         )
 
-    # Фактические остатки по ключам поставщика.
+    # Пересекающиеся позиции у других поставщиков (аналоги по soft-наименованию).
+    keys, extra_catalog, overlap_suppliers = expand_keys_with_overlapping_suppliers(
+        supplier_name, keys, mapping
+    )
+    if not extra_catalog.empty:
+        catalog = pd.concat([catalog, extra_catalog], ignore_index=True)
+        # Схлопываем дубли по sku_key после расширения.
+        catalog = catalog.drop_duplicates(subset=["sku_key"], keep="first").reset_index(drop=True)
+
+    # Фактические остатки по ключам поставщика (+ аналоги).
     stock_in = stock[stock["sku_key"].isin(keys)].copy() if not stock.empty else stock
     sales_f = sales[sales["sku_key"].isin(keys)].copy() if not sales.empty else _empty_sales_frame()
 
@@ -552,6 +704,8 @@ def filter_frames_by_supplier(
             "sales_before": len(sales),
             "stock_from_file": 0 if stock_in is None else len(stock_in),
             "allow_empty_sales": bool(sales_f.empty),
+            "overlap_suppliers": overlap_suppliers,
+            "overlap_extra_skus": int(len(extra_catalog)) if not extra_catalog.empty else 0,
         }
     )
 
@@ -627,5 +781,14 @@ def attach_supplier_attributes(
     out["barcode"] = barcodes
     out["purchase_price"] = prices
     out["order_sum"] = out.get("recommended_order", 0) * out["purchase_price"] if "recommended_order" in out.columns else 0.0
+    out["alt_supplier"] = [
+        alternative_suppliers_for_row(
+            sku_key=row.get("sku_key", ""),
+            name=row.get("name", ""),
+            barcode=row.get("barcode", ""),
+            current_supplier=row.get("supplier_name", ""),
+        )
+        for _, row in out.iterrows()
+    ]
     return out
 
