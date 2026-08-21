@@ -9,6 +9,11 @@ import pandas as pd
 
 from calculations.abc_analysis import apply_abc_analysis
 from calculations.forecasting import apply_forecast_metrics
+from calculations.quantum_orders import (
+    apply_central_supplier_order_from_stores,
+    attach_quantum_column,
+    round_orders_to_quantum,
+)
 from calculations.reorder import apply_reorder_logic
 from calculations.risk_analysis import apply_risk_analysis
 from calculations.transfers import apply_central_warehouse_transfers
@@ -113,17 +118,28 @@ def run_calculations(
         uplift=uplift_coefficient,
         downlift=downlift_coefficient,
     )
-    # Сначала поставщик/цена, затем перемещения с ЦС → магазины, затем риски по обновлённым остаткам.
+    df = attach_quantum_column(df)
+    df = round_orders_to_quantum(df, "recommended_order")
+
+    # Поставщик/цена → перемещения квантами с ЦС → заказ на ЦС = сумма магазинов → риски.
     df = attach_supplier_attributes(df)
     transfers_df = None
     if requested_grain == GRAIN_STORE:
         df, transfers_df = apply_central_warehouse_transfers(df)
+        df = round_orders_to_quantum(df, "recommended_order")
+        df = apply_central_supplier_order_from_stores(df)
     else:
         df["transfer_in"] = 0.0
         df["transfer_out"] = 0.0
         df["order_before_transfer"] = df["recommended_order"].fillna(0)
+        df["supplier_order_qty"] = df["recommended_order"].fillna(0)
+
     df = apply_risk_analysis(df)
-    df["order_sum"] = df["recommended_order"].fillna(0) * df["purchase_price"].fillna(0)
+    # Сумма заказа поставщику: в режиме магазинов — только ЦС (supplier_order_qty).
+    if "supplier_order_qty" in df.columns:
+        df["order_sum"] = df["supplier_order_qty"].fillna(0) * df["purchase_price"].fillna(0)
+    else:
+        df["order_sum"] = df["recommended_order"].fillna(0) * df["purchase_price"].fillna(0)
 
     if "store" in df.columns:
         df = df.sort_values(
@@ -145,6 +161,16 @@ def run_calculations(
         else 0.0
     )
 
+    if requested_grain == GRAIN_STORE and "supplier_order_qty" in df.columns:
+        order_mask = df["supplier_order_qty"].fillna(0) > 0
+        order_lines = int(order_mask.sum())
+        order_qty_total = float(df.loc[order_mask, "supplier_order_qty"].sum())
+        order_sum_total = float(df.loc[order_mask, "order_sum"].sum())
+    else:
+        order_lines = int((df["recommended_order"] > 0).sum())
+        order_qty_total = float(df["recommended_order"].sum())
+        order_sum_total = float(df["order_sum"].sum())
+
     meta.update(
         {
             "order_period_days": order_days,
@@ -158,9 +184,9 @@ def run_calculations(
             "oos_count": int(df["is_oos_risk"].sum()),
             "overstock_count": int(df["is_overstock"].sum()),
             "dead_count": int(df["is_dead_stock"].sum()),
-            "order_lines": int((df["recommended_order"] > 0).sum()),
-            "order_qty_total": float(df["recommended_order"].sum()),
-            "order_sum_total": float(df["order_sum"].sum()),
+            "order_lines": order_lines,
+            "order_qty_total": order_qty_total,
+            "order_sum_total": order_sum_total,
             "grain": requested_grain,
             "store_grain_fallback": store_fallback,
             "stock_no_retail_stores": stock_no_retail,
@@ -169,6 +195,7 @@ def run_calculations(
             "transfer_lines": transfer_lines,
             "transfer_qty_total": transfer_qty,
             "transfers": transfers_df,
+            "quantum_enabled": True,
             "release": "4",
         }
     )
