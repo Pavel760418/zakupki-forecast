@@ -20,6 +20,7 @@ from calculations.transfers import apply_central_warehouse_transfers
 from config.settings import SETTINGS
 from data.merge import GRAIN_NETWORK, GRAIN_STORE, build_product_frame, filter_sales_by_period
 from data.store_utils import has_retail_store_dimension, has_store_dimension
+from data.store_utils import NETWORK_STORE_LABEL, UNKNOWN_STORE_LABEL
 from data.supplier_mapping import attach_supplier_attributes
 from data.validators import validate_frames, validate_period
 
@@ -135,6 +136,15 @@ def run_calculations(
         df["supplier_order_qty"] = df["recommended_order"].fillna(0)
 
     df = apply_risk_analysis(df)
+    # Служебные строки без магазина не заказываем (ошибка сборки ассортимента).
+    if "store" in df.columns:
+        bad = df["store"].fillna("").isin({"", UNKNOWN_STORE_LABEL, NETWORK_STORE_LABEL})
+        if bad.any():
+            df.loc[bad, "recommended_order"] = 0.0
+            if "supplier_order_qty" in df.columns:
+                df.loc[bad, "supplier_order_qty"] = 0.0
+            df.loc[bad, "order_need_flag"] = False
+
     # Сумма заказа поставщику: в режиме магазинов — только ЦС (supplier_order_qty).
     if "supplier_order_qty" in df.columns:
         df["order_sum"] = df["supplier_order_qty"].fillna(0) * df["purchase_price"].fillna(0)

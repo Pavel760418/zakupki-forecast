@@ -148,19 +148,25 @@ def build_workbook(
     _build_trends_sheet(wb, df)
 
     order_view = df[df["recommended_order"] > 0].copy() if "recommended_order" in df.columns else df.copy()
+    # Лист 09: по магазинам показываем потребность точек (чтобы магазины были видны).
+    # Итог на ЦС = сумма этих строк (supplier_order_qty на дашборде).
     supplier_view = order_view
-    if grain == GRAIN_STORE and "supplier_order_qty" in df.columns:
-        supplier_view = df[df["supplier_order_qty"].fillna(0) > 0].copy()
-        if not supplier_view.empty:
-            supplier_view = supplier_view.copy()
-            supplier_view["recommended_order"] = supplier_view["supplier_order_qty"]
-            # На листе заказа поставщику всегда склад назначения — ЦС
-            supplier_view["store"] = "Склад основной1"
-        order_view = order_view[~order_view["store"].map(is_central_warehouse)].copy()
+    matrix_source = order_view
+    if grain == GRAIN_STORE:
+        retail_mask = ~df["store"].map(is_central_warehouse) if "store" in df.columns else pd.Series([True] * len(df))
+        from data.store_utils import UNKNOWN_STORE_LABEL, NETWORK_STORE_LABEL
+
+        retail = df.loc[
+            retail_mask
+            & ~df["store"].fillna("").isin({"", UNKNOWN_STORE_LABEL, NETWORK_STORE_LABEL})
+        ].copy()
+        supplier_view = retail[retail["recommended_order"].fillna(0) > 0].copy()
+        # Матрица — все точки, где поставщик есть в данных (в т.ч. заказ 0 = запас достаточен)
+        matrix_source = retail
 
     _build_supplier_order_sheet(wb, supplier_view, resolved_supplier, grain=grain)
     if grain == GRAIN_STORE:
-        _build_store_matrix(wb, order_view)
+        _build_store_matrix(wb, matrix_source)
         transfers = meta.get("transfers")
         _build_transfer_sheet(wb, transfers if isinstance(transfers, pd.DataFrame) else None, meta)
 
@@ -869,11 +875,13 @@ def _build_supplier_order_sheet(
     ws["A2"] = (
         "Заказ округлён до кванта упаковки. "
         + (
-            "В режиме магазинов количество — суммарная потребность точек на «Склад основной1» (после перемещений). "
+            "В режиме магазинов — строки по точкам с заказом > 0. "
+            "Адлер/Сочи и др. с заказом 0 смотрите на 03/10 (запас достаточен). "
+            "Сумма по магазинам = заказ на пополнение «Склад основной1». "
             if grain == GRAIN_STORE
             else ""
         )
-        + "Строки с заказом = 0 скрыты. Количество можно править — сумму пересчитайте как кол-во × цена."
+        + "Количество можно править — сумму пересчитайте как кол-во × цена."
     )
     ws["A2"].alignment = ALIGN_WRAP
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(titles))

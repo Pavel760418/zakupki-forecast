@@ -480,9 +480,14 @@ def filter_frames_by_supplier(
             sku_k = safe_str(src.get("sku_key"))
             hit = catalog_by_key.get(sku_k)
             if hit is None:
-                continue
-            matched_keys.add(safe_str(hit.get("sku_key")))
+                # Остаток с ключом поставщика, которого нет в alt-индексе catalog — всё равно берём.
+                hit = {"sku": src.get("sku"), "name": src.get("name"), "uom": src.get("uom"), "barcode": "", "sku_key": sku_k}
+                matched_keys.add(sku_k)
+            else:
+                matched_keys.add(safe_str(hit.get("sku_key")))
             store_name = safe_str(src.get("store")) or safe_str(src.get("warehouse"))
+            if not store_name:
+                continue  # не создаём «Без магазина»
             overlay_rows.append(
                 {
                     "sku": safe_str(src.get("sku")) or safe_str(hit.get("sku")),
@@ -498,25 +503,39 @@ def filter_frames_by_supplier(
                 }
             )
 
-        # SKU поставщика без строк в файле остатков — оставляем с нулём.
+        # SKU из справочника без остатков в файле — нули только по магазинам,
+        # где этот SKU реально продавался (без пустого «Без магазина» и без размножения по сети).
         for _, row in stock_f.iterrows():
             key = safe_str(row.get("sku_key"))
             if key in matched_keys:
                 continue
-            overlay_rows.append(
-                {
-                    "sku": safe_str(row.get("sku")),
-                    "name": safe_str(row.get("name")),
-                    "stock": 0.0,
-                    "uom": safe_str(row.get("uom")),
-                    "warehouse": "",
-                    "store": "",
-                    "store_key": "",
-                    "stock_amount": 0.0,
-                    "barcode": safe_str(row.get("barcode")),
-                    "sku_key": key,
-                }
-            )
+            alt = set(row.get("alt_keys") or set()) | {key}
+            sku_sales_stores: List[str] = []
+            if not sales_f.empty and "sku_key" in sales_f.columns:
+                sku_sales_stores = sorted(
+                    {
+                        safe_str(s)
+                        for s in sales_f.loc[sales_f["sku_key"].isin(alt), "store"].tolist()
+                        if safe_str(s)
+                    }
+                )
+            if not sku_sales_stores:
+                continue
+            for store_name in sku_sales_stores:
+                overlay_rows.append(
+                    {
+                        "sku": safe_str(row.get("sku")),
+                        "name": safe_str(row.get("name")),
+                        "stock": 0.0,
+                        "uom": safe_str(row.get("uom")),
+                        "warehouse": store_name,
+                        "store": store_name,
+                        "store_key": make_store_key(store_name),
+                        "stock_amount": 0.0,
+                        "barcode": safe_str(row.get("barcode")),
+                        "sku_key": key,
+                    }
+                )
         stock_f = pd.DataFrame(overlay_rows)
 
     # В расчётный pipeline не передаём служебную колонку alt_keys.

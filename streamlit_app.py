@@ -405,6 +405,37 @@ def main() -> None:
                     "См. лист **11_Перемещение_со_склада**. "
                     "Заказ поставщику уже уменьшен на эти количества."
                 )
+            if (
+                supplier_info.get("supplier_selected")
+                and meta.get("grain") == GRAIN_STORE
+                and "store" in result_df.columns
+            ):
+                from data.store_utils import UNKNOWN_STORE_LABEL, NETWORK_STORE_LABEL, is_central_warehouse
+
+                retail = result_df[
+                    ~result_df["store"].map(is_central_warehouse)
+                    & ~result_df["store"].fillna("").isin({"", UNKNOWN_STORE_LABEL, NETWORK_STORE_LABEL})
+                ]
+                with_order = sorted(
+                    {
+                        str(s)
+                        for s in retail.loc[retail["recommended_order"] > 0, "store"].tolist()
+                    }
+                )
+                all_stores = sorted({str(s) for s in retail["store"].tolist() if str(s).strip()})
+                zero_only = [s for s in all_stores if s not in with_order]
+                st.info(
+                    f"Поставщик **{supplier_info.get('supplier_name')}**: "
+                    f"SKU в привязке **{supplier_info.get('sku_keys')}**. "
+                    f"Магазины с заказом > 0: **{', '.join(with_order) or 'нет'}**. "
+                    + (
+                        f"Есть в данных, но заказ 0 (хватает остатка): **{', '.join(zero_only)}**. "
+                        if zero_only
+                        else ""
+                    )
+                    + "Точки без SKU этого поставщика в остатках/продажах в заказ не попадают "
+                    "(часто там номенклатура другого контрагента, напр. «ТД Орион»)."
+                )
 
             # Имя поставщика передаём через meta (см. build_workbook),
             # без отдельного kwargs — совместимо со всеми версиями сборщика.
