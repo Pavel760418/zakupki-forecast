@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from config.settings import SETTINGS
+from calculations.quantum_orders import quantum_floor_qty
 from data.store_utils import (
     NETWORK_STORE_LABEL,
     UNKNOWN_STORE_LABEL,
@@ -63,6 +64,7 @@ def apply_central_warehouse_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, p
             "name",
             "barcode",
             "uom",
+            "quantum",
             "transfer_qty",
             "need_before",
             "store_stock_before",
@@ -134,11 +136,9 @@ def apply_central_warehouse_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, p
             need = float(out.at[idx, "recommended_order"] or 0)
             if need <= 0:
                 continue
-            qty = min(remaining, need)
-            if round_up and qty > 0:
-                qty = float(math.floor(qty + 1e-9))
-            else:
-                qty = max(0.0, round(qty, 3))
+            quantum = int(out.at[idx, "quantum"] if "quantum" in out.columns else 1) or 1
+            # Перемещение только полными квантами.
+            qty = quantum_floor_qty(min(remaining, need), quantum)
             if qty <= 0:
                 continue
 
@@ -157,6 +157,7 @@ def apply_central_warehouse_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, p
                     "name": safe_str(out.at[idx, "name"]),
                     "barcode": safe_str(out.at[idx, "barcode"] if "barcode" in out.columns else ""),
                     "uom": safe_str(out.at[idx, "uom"] if "uom" in out.columns else ""),
+                    "quantum": quantum,
                     "transfer_qty": qty,
                     "need_before": need,
                     "store_stock_before": float(out.at[idx, "stock_before_transfer"] or 0),

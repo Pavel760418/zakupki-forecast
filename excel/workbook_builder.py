@@ -29,7 +29,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from config.settings import OUTPUT_DIR, SETTINGS
 from data.merge import GRAIN_STORE
-from data.store_utils import NETWORK_STORE_LABEL
+from data.store_utils import NETWORK_STORE_LABEL, is_central_warehouse
 from excel.formatting import (
     ALIGN_CENTER,
     ALIGN_WRAP,
@@ -59,24 +59,25 @@ COL = {
     "name": 5,
     "barcode": 6,
     "uom": 7,
-    "stock": 8,
-    "sales": 9,
-    "trend": 10,
-    "line_coef": 11,
-    "abc": 12,
-    "avg_daily": 13,
-    "forecast": 14,
-    "safety": 15,
-    "need": 16,
-    "raw_order": 17,
-    "rec_order": 18,
-    "cover": 19,
-    "status": 20,
-    "risk": 21,
-    "light": 22,
-    "price": 23,
-    "order_sum": 24,
-    "note": 25,
+    "quantum": 8,
+    "stock": 9,
+    "sales": 10,
+    "trend": 11,
+    "line_coef": 12,
+    "abc": 13,
+    "avg_daily": 14,
+    "forecast": 15,
+    "safety": 16,
+    "need": 17,
+    "raw_order": 18,
+    "rec_order": 19,
+    "cover": 20,
+    "status": 21,
+    "risk": 22,
+    "light": 23,
+    "price": 24,
+    "order_sum": 25,
+    "note": 26,
 }
 
 HEADERS = [
@@ -87,6 +88,7 @@ HEADERS = [
     "Наименование",
     "Штрихкод",
     "Ед.изм.",
+    "Квант",
     "Остаток",
     "Продажи за период",
     "Тренд (коэф.)",
@@ -145,8 +147,18 @@ def build_workbook(
     _build_filtered_sheet(wb, df[df["is_overstock"]], "07_Избыток", "Избыточные / завышенные запасы")
     _build_trends_sheet(wb, df)
 
-    order_view = df[df["recommended_order"] > 0].copy() if "recommended_order" in df.columns else df
-    _build_supplier_order_sheet(wb, order_view, resolved_supplier, grain=grain)
+    order_view = df[df["recommended_order"] > 0].copy() if "recommended_order" in df.columns else df.copy()
+    supplier_view = order_view
+    if grain == GRAIN_STORE and "supplier_order_qty" in df.columns:
+        supplier_view = df[df["supplier_order_qty"].fillna(0) > 0].copy()
+        if not supplier_view.empty:
+            supplier_view = supplier_view.copy()
+            supplier_view["recommended_order"] = supplier_view["supplier_order_qty"]
+            # На листе заказа поставщику всегда склад назначения — ЦС
+            supplier_view["store"] = "Склад основной1"
+        order_view = order_view[~order_view["store"].map(is_central_warehouse)].copy()
+
+    _build_supplier_order_sheet(wb, supplier_view, resolved_supplier, grain=grain)
     if grain == GRAIN_STORE:
         _build_store_matrix(wb, order_view)
         transfers = meta.get("transfers")
@@ -498,7 +510,8 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         COL["trend"]: "Тренд: >1 рост, <1 спад",
         COL["line_coef"]: "Локальный множитель строки",
         COL["abc"]: "Класс ABC (можно скорректировать)",
-        COL["rec_order"]: "Итоговый заказ (формула)",
+        COL["quantum"]: "Квант упаковки (шт). Заказ и перемещения округляются вверх до кванта.",
+        COL["rec_order"]: "Итоговый заказ (формула + округление до кванта в модуле)",
         COL["price"]: "Цена приходная из справочника, можно поправить",
         COL["note"]: "Свободный комментарий",
     }
@@ -528,6 +541,8 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         name_cell.alignment = ALIGN_WRAP
         ws.cell(row=r, column=COL["barcode"], value=safe_str(row.get("barcode", "")))
         ws.cell(row=r, column=COL["uom"], value=safe_str(row.get("uom", "")))
+        q_cell = ws.cell(row=r, column=COL["quantum"], value=int(row.get("quantum", 1) or 1))
+        q_cell.fill = FILL_EDIT
 
         stock_cell = ws.cell(row=r, column=COL["stock"], value=float(row["stock"]))
         sales_cell = ws.cell(row=r, column=COL["sales"], value=float(row["sales_qty"]))
@@ -537,10 +552,16 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         price_cell = ws.cell(row=r, column=COL["price"], value=float(row.get("purchase_price", 0) or 0))
         price_cell.number_format = "#,##0.00"
 
-        for cell in (stock_cell, sales_cell, trend_cell, coef_cell, abc_cell, name_cell, price_cell):
+        for cell in (stock_cell, sales_cell, trend_cell, coef_cell, abc_cell, name_cell, price_cell, q_cell):
             cell.fill = FILL_EDIT
             cell.border = THIN
 
+        # Заказ: базовая формула, затем округление вверх до кванта (столбец quantum).
+        q_l = _col_letter("quantum")
+        base_order = (
+            f"MAX(IF(AND({sales_l}{r}<=0,{trend_l}{r}<=1),0,MAX(0,CEILING({raw_l}{r},1))),"
+            f"MAX(0,CEILING('01_Настройки'!$B$20-{stock_l}{r},1)))"
+        )
         ws.cell(row=r, column=COL["avg_daily"], value=f"=IF('01_Настройки'!$B$5=0,0,{sales_l}{r}/'01_Настройки'!$B$5)")
         ws.cell(
             row=r,
@@ -553,14 +574,25 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         ws.cell(row=r, column=COL["safety"], value=f"={avg_l}{r}*{_safety_days_formula(r)}*{trend_l}{r}")
         ws.cell(row=r, column=COL["need"], value=f"={fc_l}{r}+{sf_l}{r}")
         ws.cell(row=r, column=COL["raw_order"], value=f"={need_l}{r}-{stock_l}{r}")
-        ws.cell(
-            row=r,
-            column=COL["rec_order"],
-            value=(
-                f'=MAX(IF(AND({sales_l}{r}<=0,{trend_l}{r}<=1),0,MAX(0,CEILING({raw_l}{r},1))),'
-                f'MAX(0,CEILING(\'01_Настройки\'!$B$20-{stock_l}{r},1)))'
-            ),
-        )
+        store_name = safe_str(row.get("store", ""))
+        if is_central_warehouse(store_name) and float(row.get("supplier_order_qty", 0) or 0) > 0:
+            # Заказ на ЦС = сумма потребности магазинов (считается в модуле), не локальная формула.
+            rec_cell = ws.cell(
+                row=r,
+                column=COL["rec_order"],
+                value=float(row.get("recommended_order", 0) or 0),
+            )
+            rec_cell.fill = FILL_EDIT
+        else:
+            ws.cell(
+                row=r,
+                column=COL["rec_order"],
+                value=(
+                    f'=IF(({base_order})<=0,0,'
+                    f'IF(OR({q_l}{r}="",{q_l}{r}<=1),{base_order},'
+                    f'CEILING({base_order},{q_l}{r})))'
+                ),
+            )
         ws.cell(
             row=r,
             column=COL["cover"],
@@ -831,13 +863,17 @@ def _build_supplier_order_sheet(
         titles.append("Магазин")
     if include_supplier:
         titles.append("Поставщик")
-    titles.extend(["Наименование", "Штрихкод", "Ед.", "Заказ, кол-во", "Цена", "Сумма"])
+    titles.extend(["Наименование", "Штрихкод", "Ед.", "Квант", "Заказ, кол-во", "Цена", "Сумма"])
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(titles))
 
     ws["A2"] = (
-        "Упрощённая заявка (4 релиз). Строки с заказом = 0 скрыты. "
-        "Количество можно править — сумму пересчитайте как кол-во × цена. "
-        "Цена — «Цена приходная» из справочника привязки."
+        "Заказ округлён до кванта упаковки. "
+        + (
+            "В режиме магазинов количество — суммарная потребность точек на «Склад основной1» (после перемещений). "
+            if grain == GRAIN_STORE
+            else ""
+        )
+        + "Строки с заказом = 0 скрыты. Количество можно править — сумму пересчитайте как кол-во × цена."
     )
     ws["A2"].alignment = ALIGN_WRAP
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(titles))
@@ -877,6 +913,7 @@ def _build_supplier_order_sheet(
                 safe_str(row.get("name", "")),
                 safe_str(row.get("barcode", "")),
                 safe_str(row.get("uom", "")),
+                int(row.get("quantum", 1) or 1),
                 qty,
                 price,
                 amount,
@@ -884,6 +921,8 @@ def _build_supplier_order_sheet(
         )
         r = n + 3
         name_idx = 1 + int(include_store) + int(include_supplier) + 1
+        # ... Квант, Заказ, Цена, Сумма
+        quantum_idx = len(titles) - 3
         qty_idx = len(titles) - 2
         price_idx = len(titles) - 1
         sum_idx = len(titles)
@@ -892,6 +931,8 @@ def _build_supplier_order_sheet(
             cell.border = THIN
             if c == name_idx:
                 cell.alignment = ALIGN_WRAP
+            if c == quantum_idx:
+                cell.fill = FILL_EDIT
             if c == qty_idx:
                 cell.fill = FILL_EDIT
             if c in (price_idx, sum_idx):
@@ -929,13 +970,19 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
     if subset is None or subset.empty or "store" not in subset.columns:
         ws["A1"] = "Нет данных для матрицы по магазинам."
         return
-    stores = sorted({safe_str(x) for x in subset["store"].tolist() if safe_str(x)})
-    headers = ["Поставщик", "Наименование", "Штрихкод"] + stores + ["Итого заказ", "Сумма, ₽"]
-    ws["A1"] = "ЗАКАЗ SKU × МАГАЗИН"
+    stores = sorted(
+        {
+            safe_str(x)
+            for x in subset["store"].tolist()
+            if safe_str(x) and not is_central_warehouse(x)
+        }
+    )
+    headers = ["Поставщик", "Наименование", "Штрихкод", "Квант"] + stores + ["Итого заказ", "Сумма, ₽"]
+    ws["A1"] = "ЗАКАЗ SKU × МАГАЗИН (кванты)"
     ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
     ws["A1"].fill = FILL_HEADER
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
-    ws["A2"] = "Пустая ячейка = заказ 0 в этой точке. Не замена листа 03_Расчёт_заказа."
+    ws["A2"] = "Количество в точках уже кратно кванту. Пустая ячейка = заказ 0. Центральный склад в матрицу не входит."
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
 
     for c, t in enumerate(headers, 1):
@@ -954,6 +1001,7 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
                 "supplier": safe_str(row.get("supplier_name", "")),
                 "name": safe_str(row.get("name", "")),
                 "barcode": safe_str(row.get("barcode", "")),
+                "quantum": int(row.get("quantum", 1) or 1),
                 "price": float(row.get("purchase_price", 0) or 0),
                 "qty": {s: 0.0 for s in stores},
             },
@@ -966,7 +1014,7 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
     r = 4
     for item in sorted(grouped.values(), key=lambda x: (x["supplier"], x["name"])):
         total = sum(item["qty"].values())
-        vals = [item["supplier"], item["name"], item["barcode"]]
+        vals = [item["supplier"], item["name"], item["barcode"], item["quantum"]]
         vals.extend(item["qty"][s] or None for s in stores)
         vals.extend([total, round(total * item["price"], 2)])
         for c, v in enumerate(vals, 1):
@@ -974,7 +1022,9 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
             cell.border = THIN
             if c in (1, 2):
                 cell.alignment = ALIGN_WRAP
-            if 4 <= c <= 3 + len(stores) and v:
+            if c == 4:
+                cell.fill = FILL_EDIT
+            if 5 <= c <= 4 + len(stores) and v:
                 cell.fill = FILL_EDIT
             if c >= len(vals) - 1:
                 cell.fill = FILL_FORMULA
@@ -982,10 +1032,11 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
                 cell.number_format = "#,##0.00"
         ws.row_dimensions[r].height = 28
         r += 1
-    ws.freeze_panes = "D4"
+    ws.freeze_panes = "E4"
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 55
     ws.column_dimensions["C"].width = 16
+    ws.column_dimensions["D"].width = 10
 
 
 def _build_transfer_sheet(
@@ -1008,6 +1059,7 @@ def _build_transfer_sheet(
         "Наименование",
         "Штрихкод",
         "Ед.",
+        "Квант",
         "Кол-во переместить",
         "Потребность до",
         "Остаток в магазине до",
@@ -1021,9 +1073,10 @@ def _build_transfer_sheet(
     ]
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(titles))
     ws["A2"] = (
+        "Перемещение только полными квантами. "
         "Сначала закрываем потребность магазинов остатком «Склад основной1». "
         "Приоритет: Флагман, далее точки по убыванию продаж SKU. "
-        "Лист 09_Заказ_поставщику уже уменьшен на эти перемещения. "
+        "Лист 09_Заказ_поставщику = сумма остаточной потребности магазинов на ЦС. "
         f"Строк перемещения: {int(meta.get('transfer_lines', 0) or 0)}, "
         f"всего шт: {float(meta.get('transfer_qty_total', 0) or 0):.0f}."
     )
@@ -1072,6 +1125,7 @@ def _build_transfer_sheet(
             safe_str(row.get("name", "")),
             safe_str(row.get("barcode", "")),
             safe_str(row.get("uom", "")),
+            int(row.get("quantum", 1) or 1),
             qty,
             float(row.get("need_before", 0) or 0),
             float(row.get("store_stock_before", 0) or 0),
@@ -1089,9 +1143,9 @@ def _build_transfer_sheet(
             cell.border = THIN
             if c == 6:
                 cell.alignment = ALIGN_WRAP
-            if c == 9:
+            if c in (9, 10):
                 cell.fill = FILL_EDIT
-            if c in (17, 18):
+            if c in (18, 19):
                 cell.fill = FILL_FORMULA
                 cell.number_format = "#,##0.00"
         ws.row_dimensions[r].height = 28
@@ -1102,8 +1156,8 @@ def _build_transfer_sheet(
         ws.cell(row=tot, column=c).fill = FILL_HEADER
         ws.cell(row=tot, column=c).font = FONT_HEADER
         ws.cell(row=tot, column=c).border = THIN
-    ws.cell(row=tot, column=9, value=total_qty)
-    sum_cell = ws.cell(row=tot, column=18, value=round(total_sum, 2))
+    ws.cell(row=tot, column=10, value=total_qty)
+    sum_cell = ws.cell(row=tot, column=19, value=round(total_sum, 2))
     sum_cell.number_format = "#,##0.00"
 
     ws.auto_filter.ref = f"A3:{get_column_letter(len(titles))}{n + 3}"
