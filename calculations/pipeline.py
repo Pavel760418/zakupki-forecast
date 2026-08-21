@@ -11,6 +11,7 @@ from calculations.abc_analysis import apply_abc_analysis
 from calculations.forecasting import apply_forecast_metrics
 from calculations.reorder import apply_reorder_logic
 from calculations.risk_analysis import apply_risk_analysis
+from calculations.transfers import apply_central_warehouse_transfers
 from config.settings import SETTINGS
 from data.merge import GRAIN_NETWORK, GRAIN_STORE, build_product_frame, filter_sales_by_period
 from data.store_utils import has_retail_store_dimension, has_store_dimension
@@ -112,8 +113,16 @@ def run_calculations(
         uplift=uplift_coefficient,
         downlift=downlift_coefficient,
     )
-    df = apply_risk_analysis(df)
+    # Сначала поставщик/цена, затем перемещения с ЦС → магазины, затем риски по обновлённым остаткам.
     df = attach_supplier_attributes(df)
+    transfers_df = None
+    if requested_grain == GRAIN_STORE:
+        df, transfers_df = apply_central_warehouse_transfers(df)
+    else:
+        df["transfer_in"] = 0.0
+        df["transfer_out"] = 0.0
+        df["order_before_transfer"] = df["recommended_order"].fillna(0)
+    df = apply_risk_analysis(df)
     df["order_sum"] = df["recommended_order"].fillna(0) * df["purchase_price"].fillna(0)
 
     if "store" in df.columns:
@@ -128,6 +137,13 @@ def run_calculations(
         )
     df = df.reset_index(drop=True)
     df["row_id"] = range(1, len(df) + 1)
+
+    transfer_lines = int(len(transfers_df)) if transfers_df is not None and not transfers_df.empty else 0
+    transfer_qty = (
+        float(transfers_df["transfer_qty"].sum())
+        if transfers_df is not None and not transfers_df.empty
+        else 0.0
+    )
 
     meta.update(
         {
@@ -150,6 +166,9 @@ def run_calculations(
             "stock_no_retail_stores": stock_no_retail,
             "sales_has_stores": sales_has_stores,
             "stock_has_stores": stock_has_stores,
+            "transfer_lines": transfer_lines,
+            "transfer_qty_total": transfer_qty,
+            "transfers": transfers_df,
             "release": "4",
         }
     )

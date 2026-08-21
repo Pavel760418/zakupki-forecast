@@ -149,6 +149,8 @@ def build_workbook(
     _build_supplier_order_sheet(wb, order_view, resolved_supplier, grain=grain)
     if grain == GRAIN_STORE:
         _build_store_matrix(wb, order_view)
+        transfers = meta.get("transfers")
+        _build_transfer_sheet(wb, transfers if isinstance(transfers, pd.DataFrame) else None, meta)
 
     wb.save(output_path)
     logger.info("Excel сохранён: %s", output_path)
@@ -191,6 +193,12 @@ def _build_instruction(
         ),
         (
             "10_Матрица_заказ — шахматка SKU × магазин (только если включена детализация по магазинам).",
+            False,
+            11,
+        ),
+        (
+            "11_Перемещение_со_склада — что переместить с «Склад основной» в точки "
+            "до заказа поставщику. Приоритет: Флагман, далее магазины по объёму продаж.",
             False,
             11,
         ),
@@ -564,6 +572,12 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         sum_cell = ws.cell(row=r, column=COL["order_sum"], value=f"={rec_l}{r}*{price_l}{r}")
         sum_cell.number_format = "#,##0.00"
         note = ws.cell(row=r, column=COL["note"], value="")
+        tin = float(row.get("transfer_in", 0) or 0)
+        tout = float(row.get("transfer_out", 0) or 0)
+        if tin > 0:
+            note.value = f"Переместить на точку: +{tin:g}"
+        elif tout > 0:
+            note.value = f"Списать со склада: −{tout:g}"
         note.fill = FILL_EDIT
 
         formula_cols = {
@@ -972,3 +986,128 @@ def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 55
     ws.column_dimensions["C"].width = 16
+
+
+def _build_transfer_sheet(
+    wb: Workbook,
+    transfers: pd.DataFrame | None,
+    meta: Dict[str, Any],
+) -> None:
+    """Лист перемещений: Склад основной → магазины (до заказа поставщику)."""
+    ws = _ws(wb, "11_Перемещение_со_склада")
+    ws["A1"] = "ПЕРЕМЕСТИТЬ СО СКЛАДА В МАГАЗИН (до заказа поставщику)"
+    ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill = FILL_HEADER
+
+    titles = [
+        "№",
+        "Со склада",
+        "В магазин",
+        "Приоритет",
+        "Артикул",
+        "Наименование",
+        "Штрихкод",
+        "Ед.",
+        "Кол-во переместить",
+        "Потребность до",
+        "Остаток в магазине до",
+        "Остаток на складе до",
+        "Остаток на складе после",
+        "Заказ поставщику после",
+        "Продажи SKU в точке",
+        "Поставщик",
+        "Цена",
+        "Сумма (справка)",
+    ]
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(titles))
+    ws["A2"] = (
+        "Сначала закрываем потребность магазинов остатком «Склад основной1». "
+        "Приоритет: Флагман, далее точки по убыванию продаж SKU. "
+        "Лист 09_Заказ_поставщику уже уменьшен на эти перемещения. "
+        f"Строк перемещения: {int(meta.get('transfer_lines', 0) or 0)}, "
+        f"всего шт: {float(meta.get('transfer_qty_total', 0) or 0):.0f}."
+    )
+    ws["A2"].alignment = ALIGN_WRAP
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(titles))
+    ws.row_dimensions[2].height = 36
+
+    for c, t in enumerate(titles, 1):
+        cell = ws.cell(row=3, column=c, value=t)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.border = THIN
+        cell.alignment = ALIGN_CENTER
+
+    if transfers is None or transfers.empty:
+        ws["A4"] = (
+            "Нет предложений по перемещению: на центральном складе нет остатка "
+            "под текущую потребность магазинов, либо детализация не по магазинам."
+        )
+        ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=len(titles))
+        autosize_columns(ws, name_col=6)
+        return
+
+    view = transfers.sort_values(
+        ["priority_rank", "to_store", "name"],
+        ascending=[True, True, True],
+    )
+    total_qty = 0.0
+    total_sum = 0.0
+    n = 0
+    for _, row in view.iterrows():
+        qty = float(row.get("transfer_qty", 0) or 0)
+        if qty <= 0:
+            continue
+        n += 1
+        price = float(row.get("purchase_price", 0) or 0)
+        amount = round(qty * price, 2)
+        total_qty += qty
+        total_sum += amount
+        vals = [
+            n,
+            safe_str(row.get("from_store", "Склад основной1")),
+            safe_str(row.get("to_store", "")),
+            int(row.get("priority_rank", 0) or 0),
+            safe_str(row.get("sku", "")),
+            safe_str(row.get("name", "")),
+            safe_str(row.get("barcode", "")),
+            safe_str(row.get("uom", "")),
+            qty,
+            float(row.get("need_before", 0) or 0),
+            float(row.get("store_stock_before", 0) or 0),
+            float(row.get("central_stock_before", 0) or 0),
+            float(row.get("central_stock_after", 0) or 0),
+            float(row.get("order_after", 0) or 0),
+            float(row.get("sales_qty", 0) or 0),
+            safe_str(row.get("supplier_name", "")),
+            price,
+            amount,
+        ]
+        r = n + 3
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.border = THIN
+            if c == 6:
+                cell.alignment = ALIGN_WRAP
+            if c == 9:
+                cell.fill = FILL_EDIT
+            if c in (17, 18):
+                cell.fill = FILL_FORMULA
+                cell.number_format = "#,##0.00"
+        ws.row_dimensions[r].height = 28
+
+    tot = n + 4
+    ws.cell(row=tot, column=1, value="ИТОГО")
+    for c in range(1, len(titles) + 1):
+        ws.cell(row=tot, column=c).fill = FILL_HEADER
+        ws.cell(row=tot, column=c).font = FONT_HEADER
+        ws.cell(row=tot, column=c).border = THIN
+    ws.cell(row=tot, column=9, value=total_qty)
+    sum_cell = ws.cell(row=tot, column=18, value=round(total_sum, 2))
+    sum_cell.number_format = "#,##0.00"
+
+    ws.auto_filter.ref = f"A3:{get_column_letter(len(titles))}{n + 3}"
+    ws.freeze_panes = "A4"
+    autosize_columns(ws, name_col=6)
+    ws.column_dimensions["A"].width = 6
+    ws.column_dimensions["F"].width = 55
