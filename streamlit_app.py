@@ -58,11 +58,10 @@ def _save_upload(uploaded_file) -> Path:
 
 @st.cache_data(show_spinner=False)
 def _load_supplier_options() -> tuple[str, ...]:
-    """Стабильный tuple опций для selectbox (кэш Streamlit)."""
+    """Стабильный tuple опций для UI (кэш Streamlit)."""
     try:
         mapping = get_cached_supplier_mapping()
         names = [safe for safe in (str(x).strip() for x in list_suppliers(mapping)) if safe]
-        # Уникальные, порядок сохранён
         uniq: list[str] = []
         seen: set[str] = set()
         for name in names:
@@ -74,14 +73,28 @@ def _load_supplier_options() -> tuple[str, ...]:
         return (SUPPLIER_NONE_LABEL,)
 
 
+def _supplier_display_label(name: str, idx: int) -> str:
+    """Подпись без ASCII-кавычек — BaseWeb Select на Cloud иначе роняет removeChild."""
+    text = (
+        str(name)
+        .replace("\u00a0", " ")
+        .replace('"', "«")
+        .replace("“", "«")
+        .replace("”", "»")
+        .replace("'", "ʼ")
+        .strip()
+    )
+    return text or f"Поставщик #{idx}"
+
+
 def _render_supplier_block() -> str | None:
     """
     Опциональный выбор поставщика.
 
-    Важно для Streamlit Cloud:
-    - не смешивать index= и key= у selectbox;
-    - не менять дерево виджетов между успешным/ошибочным путём;
-    - выбирать по индексу (имена поставщиков содержат кавычки и ломают DOM).
+    Обход бага Streamlit Cloud (React removeChild на BaseWeb Select/Radio):
+    - на старте тяжёлые виджеты списка НЕ создаём;
+    - выбор через checkbox + поиск + кнопки (без selectbox);
+    - в подписях убираем ASCII-кавычки.
     """
     st.subheader("4. Поставщик (опционально)")
     st.caption(
@@ -89,33 +102,55 @@ def _render_supplier_block() -> str | None:
         "и фильтрует SKU по файлу привязки. Отсутствие остатков в файле не блокирует расчёт."
     )
 
-    labels = list(_load_supplier_options())
-    if not labels:
-        labels = [SUPPLIER_NONE_LABEL]
+    labels = list(_load_supplier_options()) or [SUPPLIER_NONE_LABEL]
+    real_suppliers = [x for x in labels if x != SUPPLIER_NONE_LABEL]
+    st.caption(f"В справочнике привязки: **{len(real_suppliers)}** поставщиков.")
 
-    st.caption(f"В справочнике привязки: **{max(0, len(labels) - 1)}** поставщиков.")
-
-    # Выбор по индексу — устойчивее для React DOM (имена с «"» внутри).
-    idx_key = "supplier_select_idx"
-    st.session_state.pop("supplier_select", None)  # старый key с текстом опции
-    current_idx = st.session_state.get(idx_key, 0)
-    if not isinstance(current_idx, int) or current_idx < 0 or current_idx >= len(labels):
-        st.session_state[idx_key] = 0
-
-    selected_idx = st.selectbox(
-        "Поставщик для расчёта заказа",
-        options=list(range(len(labels))),
-        format_func=lambda i: labels[i],
-        key=idx_key,
-        help="Оставьте «Не выбран / общий расчёт», чтобы посчитать всю номенклатуру.",
+    filter_on = st.checkbox(
+        "Ограничить расчёт одним поставщиком",
+        value=False,
+        key="supplier_filter_on_v5",
+        help="Включите, чтобы выбрать контрагента из списка.",
     )
-    selected_supplier = labels[int(selected_idx)]
+    if not filter_on:
+        st.session_state.pop("supplier_picked_v5", None)
+        st.info("Режим: **все контрагенты** (поставщик будет указан в строке товара)")
+        return None
 
-    if selected_supplier != SUPPLIER_NONE_LABEL:
-        st.info(f"Режим: расчёт по поставщику **{selected_supplier}**")
-        return selected_supplier
+    if not real_suppliers:
+        st.warning("Справочник поставщиков пуст — доступен только общий расчёт.")
+        st.info("Режим: **все контрагенты** (поставщик будет указан в строке товара)")
+        return None
 
-    st.info("Режим: **все контрагенты** (поставщик будет указан в строке товара)")
+    picked = st.session_state.get("supplier_picked_v5")
+    if picked and picked in real_suppliers:
+        st.info(f"Режим: расчёт по поставщику **{picked}**")
+        if st.button("Сменить поставщика", key="supplier_clear_v5"):
+            st.session_state.pop("supplier_picked_v5", None)
+            st.rerun()
+        return str(picked)
+
+    query = st.text_input(
+        "Поиск поставщика",
+        value="",
+        key="supplier_search_v5",
+        placeholder="Начните вводить название…",
+    )
+    q = query.strip().casefold()
+    matches = [n for n in real_suppliers if q in n.casefold()] if q else list(real_suppliers)
+    if not matches:
+        st.warning("Ничего не найдено. Измените строку поиска.")
+        st.info("Режим: **все контрагенты** (поставщик будет указан в строке товара)")
+        return None
+
+    st.caption("Нажмите на нужного поставщика:" + (f" показано {min(len(matches), 30)} из {len(matches)}" if len(matches) > 30 else ""))
+    for i, real in enumerate(matches[:30]):
+        disp = _supplier_display_label(real, i)
+        if st.button(disp, key=f"supplier_btn_v5_{i}", use_container_width=True):
+            st.session_state["supplier_picked_v5"] = real
+            st.rerun()
+
+    st.info("Режим: **все контрагенты** — поставщик ещё не выбран (включите фильтр и нажмите на имя).")
     return None
 
 
