@@ -28,6 +28,8 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from config.settings import OUTPUT_DIR, SETTINGS
+from data.merge import GRAIN_STORE
+from data.store_utils import NETWORK_STORE_LABEL
 from excel.formatting import (
     ALIGN_CENTER,
     ALIGN_WRAP,
@@ -47,36 +49,44 @@ from utils.helpers import ensure_output_dir, safe_str, timestamp_filename
 
 logger = logging.getLogger("zakupki_forecast.excel")
 
-# Индексы колонок листа «Расчёт_заказа» (1-based)
-# Редактируемые (жёлтые): C остаток, D продажи, E тренд ручной, F коэф.строки, G ABC
-# Формульные (зелёные): остальное
+# Индексы колонок листа «Расчёт_заказа» (1-based), 4 релиз
+# Жёлтые: магазин/поставщик справочные; остаток, продажи, тренд, коэф.строки, ABC, цена, комментарий
 COL = {
     "id": 1,
-    "sku": 2,
-    "name": 3,
-    "stock": 4,
-    "sales": 5,
-    "trend": 6,
-    "line_coef": 7,
-    "abc": 8,
-    "avg_daily": 9,
-    "forecast": 10,
-    "safety": 11,
-    "need": 12,
-    "raw_order": 13,
-    "rec_order": 14,
-    "cover": 15,
-    "status": 16,
-    "risk": 17,
-    "light": 18,
-    "uom": 19,
-    "note": 20,
+    "store": 2,
+    "supplier": 3,
+    "sku": 4,
+    "name": 5,
+    "barcode": 6,
+    "uom": 7,
+    "stock": 8,
+    "sales": 9,
+    "trend": 10,
+    "line_coef": 11,
+    "abc": 12,
+    "avg_daily": 13,
+    "forecast": 14,
+    "safety": 15,
+    "need": 16,
+    "raw_order": 17,
+    "rec_order": 18,
+    "cover": 19,
+    "status": 20,
+    "risk": 21,
+    "light": 22,
+    "price": 23,
+    "order_sum": 24,
+    "note": 25,
 }
 
 HEADERS = [
     "№",
+    "Магазин",
+    "Поставщик",
     "Артикул",
     "Наименование",
+    "Штрихкод",
+    "Ед.изм.",
     "Остаток",
     "Продажи за период",
     "Тренд (коэф.)",
@@ -92,9 +102,14 @@ HEADERS = [
     "Статус",
     "Риск",
     "Светофор",
-    "Ед.изм.",
+    "Цена приходная",
+    "Сумма заказа",
     "Комментарий закупщика",
 ]
+
+
+def _col_letter(key: str) -> str:
+    return get_column_letter(COL[key])
 
 
 def build_workbook(
@@ -103,11 +118,13 @@ def build_workbook(
     output_path: str | Path | None = None,
     supplier_name: str | None = None,
 ) -> Path:
-    """Создаёт итоговый xlsx и возвращает путь.
+    """Создаёт итоговый xlsx (4 релиз): расчёт + упрощённый заказ поставщику."""
+    resolved_supplier = safe_str(supplier_name).strip() if supplier_name else ""
+    if not resolved_supplier:
+        resolved_supplier = safe_str(meta.get("supplier_name", "")).strip()
+    resolved_supplier = resolved_supplier or None
+    grain = meta.get("grain", "network")
 
-    supplier_name — опционально. Если передан, добавляется лист «09_Заказ_поставщику».
-    Без выбора поставщика структура книги остаётся прежней.
-    """
     ensure_output_dir()
     if output_path is None:
         output_path = OUTPUT_DIR / timestamp_filename(SETTINGS["workbook_name_prefix"])
@@ -115,11 +132,10 @@ def build_workbook(
         output_path = Path(output_path)
 
     wb = Workbook()
-    # Удаляем дефолтный лист — создадим свои
     default = wb.active
     wb.remove(default)
 
-    _build_instruction(wb, supplier_name=supplier_name)
+    _build_instruction(wb, supplier_name=resolved_supplier, grain=grain)
     _build_settings(wb, meta)
     _build_dashboard(wb, df, meta)
     _build_main_calc(wb, df, meta)
@@ -129,10 +145,10 @@ def build_workbook(
     _build_filtered_sheet(wb, df[df["is_overstock"]], "07_Избыток", "Избыточные / завышенные запасы")
     _build_trends_sheet(wb, df)
 
-    # Опциональный лист: только при явном выборе поставщика
-    if supplier_name and safe_str(supplier_name).strip():
-        order_view = df[df["recommended_order"] > 0].copy() if "recommended_order" in df.columns else df
-        _build_supplier_order_sheet(wb, order_view, safe_str(supplier_name).strip())
+    order_view = df[df["recommended_order"] > 0].copy() if "recommended_order" in df.columns else df
+    _build_supplier_order_sheet(wb, order_view, resolved_supplier, grain=grain)
+    if grain == GRAIN_STORE:
+        _build_store_matrix(wb, order_view)
 
     wb.save(output_path)
     logger.info("Excel сохранён: %s", output_path)
@@ -143,7 +159,9 @@ def _ws(wb: Workbook, title: str):
     return wb.create_sheet(title)
 
 
-def _build_instruction(wb: Workbook, supplier_name: str | None = None) -> None:
+def _build_instruction(
+    wb: Workbook, supplier_name: str | None = None, grain: str = "network"
+) -> None:
     ws = _ws(wb, "00_Инструкция")
     lines = [
         ("ИНСТРУКЦИЯ ДЛЯ ЗАКУПЩИКА", True, 16),
@@ -167,7 +185,18 @@ def _build_instruction(wb: Workbook, supplier_name: str | None = None) -> None:
         ("07_Избыток — завышенные запасы.", False, 11),
         ("08_Тренды — рост / спад спроса.", False, 11),
         (
-            "09_Заказ_поставщику — заказ только по выбранному поставщику (появляется при режиме расчёта по поставщику).",
+            "09_Заказ_поставщику — упрощённая заявка: наименование, количество, штрихкод, цена, сумма. Есть всегда.",
+            False,
+            11,
+        ),
+        (
+            "10_Матрица_заказ — шахматка SKU × магазин (только если включена детализация по магазинам).",
+            False,
+            11,
+        ),
+        (
+            "Четвёртый релиз: в расчёте видны магазин, поставщик, штрихкод и цена. "
+            f"Детализация этой книги: {'по магазинам' if grain == GRAIN_STORE else 'сводно по сети'}.",
             False,
             11,
         ),
@@ -185,7 +214,7 @@ def _build_instruction(wb: Workbook, supplier_name: str | None = None) -> None:
         ("", False, 11),
         ("3. Что МОЖНО редактировать (жёлтые ячейки)", True, 13),
         ("На «01_Настройки»: дни периода продаж, дни периода заказа, коэф. заказа, uplift/downlift, safety stock, пороги.", False, 11),
-        ("На «03_Расчёт_заказа»: Остаток, Продажи за период, Тренд, Коэф. строки, ABC, Комментарий, Наименование.", False, 11),
+        ("На «03_Расчёт_заказа»: Остаток, Продажи, Тренд, Коэф. строки, ABC, Цена приходная, Комментарий, Наименование.", False, 11),
         ("Можно добавлять строки ВНИЗУ таблицы, копируя формулы с соседней строки.", False, 11),
         ("", False, 11),
         ("4. Что НЕЛЬЗЯ редактировать (зелёные / расчётные)", True, 13),
@@ -217,6 +246,7 @@ def _build_instruction(wb: Workbook, supplier_name: str | None = None) -> None:
         ("Рекомендуемый заказ = MAX(расчётный; MAX(0; МинОстаток - Остаток))", False, 11),
         ("Минимальный остаток по умолчанию — 24 шт на каждый SKU (параметр на «01_Настройки»).", False, 11),
         ("Для неликвидов без продаж расчётный заказ обнуляется, но докупка до минимального остатка сохраняется.", False, 11),
+        ("Сумма заказа = Рекомендуемый заказ × Цена приходная.", False, 11),
         ("", False, 11),
         ("9. Советы", True, 13),
         ("Сначала отфильтруйте 🔴 и 🟠, затем класс A, затем остальное.", False, 11),
@@ -313,6 +343,9 @@ def _build_dashboard(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         (11, "Горизонт заказа, дни", meta.get("order_period_days", "")),
         (12, "Продажи за период, ед.", round(meta.get("total_sales_qty", 0), 2)),
         (13, "Текущий остаток, ед.", round(meta.get("total_stock", 0), 2)),
+        (14, "Детализация", "по магазинам" if meta.get("grain") == GRAIN_STORE else "сводно по сети"),
+        (15, "Магазинов в расчёте", meta.get("store_count", 0)),
+        (16, "Сумма заказа, ₽", round(meta.get("order_sum_total", 0), 2)),
     ]
     ws["A2"] = "Показатель"
     ws["B2"] = "Значение"
@@ -375,60 +408,69 @@ def _build_dashboard(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
 
 
 def _abc_mult_formula(row: int) -> str:
-    """Множитель ABC из настроек."""
+    abc = _col_letter("abc")
     return (
-        f'IF(H{row}="A",\'01_Настройки\'!$B$13,'
-        f'IF(H{row}="B",\'01_Настройки\'!$B$14,\'01_Настройки\'!$B$15))'
+        f'IF({abc}{row}="A",\'01_Настройки\'!$B$13,'
+        f'IF({abc}{row}="B",\'01_Настройки\'!$B$14,\'01_Настройки\'!$B$15))'
     )
 
 
 def _safety_days_formula(row: int) -> str:
+    abc = _col_letter("abc")
     return (
-        f'IF(H{row}="A",\'01_Настройки\'!$B$10,'
-        f'IF(H{row}="B",\'01_Настройки\'!$B$11,\'01_Настройки\'!$B$12))'
+        f'IF({abc}{row}="A",\'01_Настройки\'!$B$10,'
+        f'IF({abc}{row}="B",\'01_Настройки\'!$B$11,\'01_Настройки\'!$B$12))'
     )
 
 
 def _status_formula(row: int) -> str:
-    """Статус через формулы Excel — пересчитывается при правках."""
+    sales = _col_letter("sales")
+    cover = _col_letter("cover")
+    stock = _col_letter("stock")
+    rec = _col_letter("rec_order")
+    abc = _col_letter("abc")
+    trend = _col_letter("trend")
     return (
-        f'IF(OR(AND(E{row}>0,O{row}<\'01_Настройки\'!$B$17),AND(E{row}>0,D{row}<=0)),"Критический дефицит",'
-        f'IF(AND(E{row}>0,O{row}<\'01_Настройки\'!$B$16),"Риск out-of-stock",'
-        f'IF(AND(E{row}<=0,D{row}>0),"Неликвид / зависший",'
-        f'IF(AND(E{row}>0,O{row}>\'01_Настройки\'!$B$18),"Избыточный запас",'
-        f'IF(AND(N{row}>0,H{row}="A"),"Приоритетный заказ (A)",'
-        f'IF(AND(N{row}>0,F{row}>=1.15),"Рост спроса — усилить заказ",'
-        f'IF(N{row}>0,"К заказу","Запас достаточен")))))))'
+        f'IF(OR(AND({sales}{row}>0,{cover}{row}<\'01_Настройки\'!$B$17),AND({sales}{row}>0,{stock}{row}<=0)),"Критический дефицит",'
+        f'IF(AND({sales}{row}>0,{cover}{row}<\'01_Настройки\'!$B$16),"Риск out-of-stock",'
+        f'IF(AND({sales}{row}<=0,{stock}{row}>0),"Неликвид / зависший",'
+        f'IF(AND({sales}{row}>0,{cover}{row}>\'01_Настройки\'!$B$18),"Избыточный запас",'
+        f'IF(AND({rec}{row}>0,{abc}{row}="A"),"Приоритетный заказ (A)",'
+        f'IF(AND({rec}{row}>0,{trend}{row}>=1.15),"Рост спроса — усилить заказ",'
+        f'IF({rec}{row}>0,"К заказу","Запас достаточен")))))))'
     )
 
 
 def _risk_formula(row: int) -> str:
+    st = _col_letter("status")
     return (
-        f'IF(P{row}="Критический дефицит","Высокий риск OOS",'
-        f'IF(P{row}="Риск out-of-stock","Средний риск OOS",'
-        f'IF(P{row}="Неликвид / зависший","Замороженный капитал",'
-        f'IF(P{row}="Избыточный запас","Завышенный stock",'
-        f'IF(P{row}="Приоритетный заказ (A)","Контроль наличия",'
-        f'IF(P{row}="Рост спроса — усилить заказ","Тренд вверх",'
-        f'IF(P{row}="К заказу","Норма","Низкий")))))))'
+        f'IF({st}{row}="Критический дефицит","Высокий риск OOS",'
+        f'IF({st}{row}="Риск out-of-stock","Средний риск OOS",'
+        f'IF({st}{row}="Неликвид / зависший","Замороженный капитал",'
+        f'IF({st}{row}="Избыточный запас","Завышенный stock",'
+        f'IF({st}{row}="Приоритетный заказ (A)","Контроль наличия",'
+        f'IF({st}{row}="Рост спроса — усилить заказ","Тренд вверх",'
+        f'IF({st}{row}="К заказу","Норма","Низкий")))))))'
     )
 
 
 def _light_formula(row: int) -> str:
+    st = _col_letter("status")
     return (
-        f'IF(P{row}="Критический дефицит","🔴",'
-        f'IF(P{row}="Риск out-of-stock","🟠",'
-        f'IF(P{row}="Неликвид / зависший","🟣",'
-        f'IF(P{row}="Избыточный запас","🟡",'
-        f'IF(P{row}="Приоритетный заказ (A)","🔵",'
-        f'IF(OR(P{row}="К заказу",P{row}="Рост спроса — усилить заказ"),"🟢","⚪"))))))'
+        f'IF({st}{row}="Критический дефицит","🔴",'
+        f'IF({st}{row}="Риск out-of-stock","🟠",'
+        f'IF({st}{row}="Неликвид / зависший","🟣",'
+        f'IF({st}{row}="Избыточный запас","🟡",'
+        f'IF({st}{row}="Приоритетный заказ (A)","🔵",'
+        f'IF(OR({st}{row}="К заказу",{st}{row}="Рост спроса — усилить заказ"),"🟢","⚪"))))))'
     )
 
 
 def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> None:
     ws = _ws(wb, "03_Расчёт_заказа")
+    grain_label = "по магазинам" if meta.get("grain") == GRAIN_STORE else "сводно по сети"
     ws["A1"] = (
-        "ОСНОВНОЙ РАСЧЁТ ЗАКАЗА  |  Жёлтые — ввод  |  Зелёные — формулы  |  "
+        f"ОСНОВНОЙ РАСЧЁТ ЗАКАЗА  |  {grain_label}  |  Жёлтые — ввод  |  Зелёные — формулы  |  "
         "Параметры: лист 01_Настройки"
     )
     ws["A1"].font = Font(bold=True, color="FFFFFF", size=12)
@@ -442,96 +484,108 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         cell.alignment = ALIGN_CENTER
         cell.border = THIN
 
-    # Подсказки на заголовках
     tips = {
-        4: "Редактируемый остаток",
-        5: "Редактируемые продажи за период",
-        6: "Тренд: >1 рост, <1 спад",
-        7: "Локальный множитель строки",
-        8: "Класс ABC (можно скорректировать)",
-        14: "Итоговый заказ (формула)",
-        20: "Свободный комментарий",
+        COL["stock"]: "Редактируемый остаток",
+        COL["sales"]: "Редактируемые продажи за период",
+        COL["trend"]: "Тренд: >1 рост, <1 спад",
+        COL["line_coef"]: "Локальный множитель строки",
+        COL["abc"]: "Класс ABC (можно скорректировать)",
+        COL["rec_order"]: "Итоговый заказ (формула)",
+        COL["price"]: "Цена приходная из справочника, можно поправить",
+        COL["note"]: "Свободный комментарий",
     }
     for col, tip in tips.items():
         ws.cell(row=2, column=col).comment = Comment(tip, "Система", width=180, height=40)
 
+    sales_l = _col_letter("sales")
+    stock_l = _col_letter("stock")
+    trend_l = _col_letter("trend")
+    coef_l = _col_letter("line_coef")
+    avg_l = _col_letter("avg_daily")
+    fc_l = _col_letter("forecast")
+    sf_l = _col_letter("safety")
+    need_l = _col_letter("need")
+    raw_l = _col_letter("raw_order")
+    rec_l = _col_letter("rec_order")
+    price_l = _col_letter("price")
+
     n = len(df)
     for i, (_, row) in enumerate(df.iterrows()):
-        r = i + 3  # данные с 3-й строки
-        # Значения
-        ws.cell(row=r, column=1, value=int(row["row_id"]))
-        ws.cell(row=r, column=2, value=safe_str(row["sku"]))
-        name_cell = ws.cell(row=r, column=3, value=safe_str(row["name"]))
+        r = i + 3
+        ws.cell(row=r, column=COL["id"], value=int(row["row_id"]))
+        ws.cell(row=r, column=COL["store"], value=safe_str(row.get("store", NETWORK_STORE_LABEL)))
+        ws.cell(row=r, column=COL["supplier"], value=safe_str(row.get("supplier_name", "")))
+        ws.cell(row=r, column=COL["sku"], value=safe_str(row["sku"]))
+        name_cell = ws.cell(row=r, column=COL["name"], value=safe_str(row["name"]))
         name_cell.alignment = ALIGN_WRAP
+        ws.cell(row=r, column=COL["barcode"], value=safe_str(row.get("barcode", "")))
+        ws.cell(row=r, column=COL["uom"], value=safe_str(row.get("uom", "")))
 
-        stock_cell = ws.cell(row=r, column=4, value=float(row["stock"]))
-        sales_cell = ws.cell(row=r, column=5, value=float(row["sales_qty"]))
-        trend_cell = ws.cell(row=r, column=6, value=round(float(row["trend_coef"]), 4))
-        coef_cell = ws.cell(row=r, column=7, value=1.0)
-        abc_cell = ws.cell(row=r, column=8, value=str(row["abc_class"]))
+        stock_cell = ws.cell(row=r, column=COL["stock"], value=float(row["stock"]))
+        sales_cell = ws.cell(row=r, column=COL["sales"], value=float(row["sales_qty"]))
+        trend_cell = ws.cell(row=r, column=COL["trend"], value=round(float(row["trend_coef"]), 4))
+        coef_cell = ws.cell(row=r, column=COL["line_coef"], value=1.0)
+        abc_cell = ws.cell(row=r, column=COL["abc"], value=str(row["abc_class"]))
+        price_cell = ws.cell(row=r, column=COL["price"], value=float(row.get("purchase_price", 0) or 0))
+        price_cell.number_format = "#,##0.00"
 
-        for cell in (stock_cell, sales_cell, trend_cell, coef_cell, abc_cell, name_cell):
+        for cell in (stock_cell, sales_cell, trend_cell, coef_cell, abc_cell, name_cell, price_cell):
             cell.fill = FILL_EDIT
             cell.border = THIN
 
-        # Формулы
-        # I: среднедневные = продажи / дни
-        ws.cell(row=r, column=9, value=f"=IF('01_Настройки'!$B$5=0,0,E{r}/'01_Настройки'!$B$5)")
-        # J: прогноз
+        ws.cell(row=r, column=COL["avg_daily"], value=f"=IF('01_Настройки'!$B$5=0,0,{sales_l}{r}/'01_Настройки'!$B$5)")
         ws.cell(
             row=r,
-            column=10,
+            column=COL["forecast"],
             value=(
-                f"=I{r}*'01_Настройки'!$B$6*F{r}*'01_Настройки'!$B$7*"
-                f"'01_Настройки'!$B$8*'01_Настройки'!$B$9*{_abc_mult_formula(r)}*G{r}"
+                f"={avg_l}{r}*'01_Настройки'!$B$6*{trend_l}{r}*'01_Настройки'!$B$7*"
+                f"'01_Настройки'!$B$8*'01_Настройки'!$B$9*{_abc_mult_formula(r)}*{coef_l}{r}"
             ),
         )
-        # K: safety
-        ws.cell(row=r, column=11, value=f"=I{r}*{_safety_days_formula(r)}*F{r}")
-        # L: need
-        ws.cell(row=r, column=12, value=f"=J{r}+K{r}")
-        # M: need - stock
-        ws.cell(row=r, column=13, value=f"=L{r}-D{r}")
-        # N: recommended order
-        # 1) базовый расчёт с блоком неликвида
-        # 2) докупка до минимального остатка B20 (даже при нулевых продажах)
+        ws.cell(row=r, column=COL["safety"], value=f"={avg_l}{r}*{_safety_days_formula(r)}*{trend_l}{r}")
+        ws.cell(row=r, column=COL["need"], value=f"={fc_l}{r}+{sf_l}{r}")
+        ws.cell(row=r, column=COL["raw_order"], value=f"={need_l}{r}-{stock_l}{r}")
         ws.cell(
             row=r,
-            column=14,
+            column=COL["rec_order"],
             value=(
-                f'=MAX(IF(AND(E{r}<=0,F{r}<=1),0,MAX(0,CEILING(M{r},1))),'
-                f'MAX(0,CEILING(\'01_Настройки\'!$B$20-D{r},1)))'
+                f'=MAX(IF(AND({sales_l}{r}<=0,{trend_l}{r}<=1),0,MAX(0,CEILING({raw_l}{r},1))),'
+                f'MAX(0,CEILING(\'01_Настройки\'!$B$20-{stock_l}{r},1)))'
             ),
         )
-        # O: cover days
-        ws.cell(row=r, column=15, value=f"=IF(I{r}>0,D{r}/I{r},IF(D{r}>0,9999,0))")
-        # P/Q/R status/risk/light
-        ws.cell(row=r, column=16, value=f"={_status_formula(r)}")
-        ws.cell(row=r, column=17, value=f"={_risk_formula(r)}")
-        ws.cell(row=r, column=18, value=f"={_light_formula(r)}")
-
-        ws.cell(row=r, column=19, value=safe_str(row.get("uom", "")))
-        note = ws.cell(row=r, column=20, value="")
+        ws.cell(
+            row=r,
+            column=COL["cover"],
+            value=f"=IF({avg_l}{r}>0,{stock_l}{r}/{avg_l}{r},IF({stock_l}{r}>0,9999,0))",
+        )
+        ws.cell(row=r, column=COL["status"], value=f"={_status_formula(r)}")
+        ws.cell(row=r, column=COL["risk"], value=f"={_risk_formula(r)}")
+        ws.cell(row=r, column=COL["light"], value=f"={_light_formula(r)}")
+        sum_cell = ws.cell(row=r, column=COL["order_sum"], value=f"={rec_l}{r}*{price_l}{r}")
+        sum_cell.number_format = "#,##0.00"
+        note = ws.cell(row=r, column=COL["note"], value="")
         note.fill = FILL_EDIT
 
-        for c in range(1, 21):
+        formula_cols = {
+            COL["avg_daily"], COL["forecast"], COL["safety"], COL["need"], COL["raw_order"],
+            COL["rec_order"], COL["cover"], COL["status"], COL["risk"], COL["light"], COL["order_sum"],
+        }
+        wrap_cols = {COL["name"], COL["store"], COL["supplier"]}
+        for c in range(1, len(HEADERS) + 1):
             cell = ws.cell(row=r, column=c)
             cell.border = THIN
-            if c in (9, 10, 11, 12, 13, 14, 15, 16, 17, 18):
-                if cell.fill.fgColor is None or cell.fill.fgColor.rgb == "00000000":
-                    cell.fill = FILL_FORMULA
-                # не перезаписываем EDIT fill — формульные колонки точно зелёные
-            if c >= 9 and c <= 18:
+            if c in formula_cols:
                 cell.fill = FILL_FORMULA
-            cell.alignment = ALIGN_CENTER if c != 3 else ALIGN_WRAP
+            cell.alignment = ALIGN_WRAP if c in wrap_cols else ALIGN_CENTER
 
-        # Высота под длинные названия
         name_len = len(safe_str(row["name"]))
         ws.row_dimensions[r].height = max(18, min(60, 14 + name_len // 40 * 12))
 
     last_row = n + 2
+    abc_l = _col_letter("abc")
+    status_l = _col_letter("status")
+    rec_l = _col_letter("rec_order")
     if n > 0:
-        # Таблица Excel
         table_ref = f"A2:{get_column_letter(len(HEADERS))}{last_row}"
         table = Table(displayName="РасчётЗаказа", ref=table_ref)
         table.tableStyleInfo = TableStyleInfo(
@@ -542,22 +596,25 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
             showColumnStripes=False,
         )
         ws.add_table(table)
-        add_abc_validation(ws, f"H3:H{last_row}")
-        add_oos_conditional(ws, "P", 3, last_row)
-        add_order_highlight(ws, "N", 3, last_row)
+        add_abc_validation(ws, f"{abc_l}3:{abc_l}{last_row}")
+        add_oos_conditional(ws, status_l, 3, last_row)
+        add_order_highlight(ws, rec_l, 3, last_row)
     else:
         ws.auto_filter.ref = f"A2:{get_column_letter(len(HEADERS))}{max(last_row, 2)}"
 
-    ws.freeze_panes = "D3"
-    ws.column_dimensions["C"].width = 55
+    ws.freeze_panes = "F3"
+    ws.column_dimensions["E"].width = 55
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 28
     for col in range(1, len(HEADERS) + 1):
-        if col == 3:
-            continue
         letter = get_column_letter(col)
+        if letter in {"B", "C", "E"}:
+            continue
         ws.column_dimensions[letter].width = 14 if col > 3 else 12
-    ws.column_dimensions["P"].width = 28
-    ws.column_dimensions["Q"].width = 22
-    ws.column_dimensions["T"].width = 24
+    ws.column_dimensions[_col_letter("status")].width = 28
+    ws.column_dimensions[_col_letter("risk")].width = 22
+    ws.column_dimensions[_col_letter("note")].width = 24
+    ws.column_dimensions[_col_letter("barcode")].width = 16
 
 
 def _build_abc_sheet(wb: Workbook, df: pd.DataFrame) -> None:
@@ -734,70 +791,184 @@ def _build_trends_sheet(wb: Workbook, df: pd.DataFrame) -> None:
     autosize_columns(ws, name_col=2)
 
 
-def _build_supplier_order_sheet(wb: Workbook, subset: pd.DataFrame, supplier_name: str) -> None:
-    """Лист заказа выбранному поставщику (только при опциональном режиме)."""
+def _build_supplier_order_sheet(
+    wb: Workbook,
+    subset: pd.DataFrame,
+    supplier_name: str | None,
+    grain: str = "network",
+) -> None:
+    """Упрощённый заказ: наименование, количество, штрихкод, цена, сумма. Всегда."""
     ws = _ws(wb, "09_Заказ_поставщику")
-    ws["A1"] = f"ЗАКАЗ ПОСТАВЩИКУ: {supplier_name}"
+    title = "ЗАКАЗ ПОСТАВЩИКУ"
+    if supplier_name:
+        title += f": {supplier_name}"
+    elif grain == GRAIN_STORE:
+        title += " (все контрагенты, по магазинам)"
+    else:
+        title += " (все контрагенты, сводно)"
+    ws["A1"] = title
     ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
     ws["A1"].fill = FILL_HEADER
-    ws.merge_cells("A1:K1")
+
+    include_store = grain == GRAIN_STORE
+    include_supplier = not bool(supplier_name)
+    titles = ["№"]
+    if include_store:
+        titles.append("Магазин")
+    if include_supplier:
+        titles.append("Поставщик")
+    titles.extend(["Наименование", "Штрихкод", "Ед.", "Заказ, кол-во", "Цена", "Сумма"])
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(titles))
 
     ws["A2"] = (
-        "Лист формируется только при выбранном поставщике. "
-        "Показаны позиции с рекомендуемым заказом > 0."
+        "Упрощённая заявка (4 релиз). Строки с заказом = 0 скрыты. "
+        "Количество можно править — сумму пересчитайте как кол-во × цена. "
+        "Цена — «Цена приходная» из справочника привязки."
     )
     ws["A2"].alignment = ALIGN_WRAP
-    ws.merge_cells("A2:K2")
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(titles))
 
-    titles = [
-        "№",
-        "Артикул",
-        "Наименование",
-        "ABC",
-        "Остаток",
-        "Продажи",
-        "Рек. заказ",
-        "Покрытие, дни",
-        "Статус",
-        "Риск",
-        "Ед.изм.",
-    ]
     for c, t in enumerate(titles, 1):
         cell = ws.cell(row=3, column=c, value=t)
         cell.fill = FILL_HEADER
         cell.font = FONT_HEADER
         cell.border = THIN
 
-    view = subset.sort_values(
-        ["recommended_order", "name"],
-        ascending=[False, True],
-    ) if not subset.empty and "recommended_order" in subset.columns else subset
+    sort_by = [c for c in (("store",) if include_store else ()) + (("supplier_name",) if include_supplier else ()) + ("name",)]
+    view = subset.copy()
+    if not view.empty:
+        existing = [c for c in sort_by if c in view.columns]
+        if existing:
+            view = view.sort_values(existing)
 
-    for i, (_, row) in enumerate(view.iterrows(), start=4):
-        vals = [
-            i - 3,
-            row.get("sku", ""),
-            row.get("name", ""),
-            row.get("abc_class", ""),
-            float(row.get("stock", 0) or 0),
-            float(row.get("sales_qty", 0) or 0),
-            float(row.get("recommended_order", 0) or 0),
-            round(float(row.get("cover_days", 0) or 0), 2),
-            row.get("status", ""),
-            row.get("risk_level", ""),
-            row.get("uom", ""),
-        ]
+    total_qty = 0.0
+    total_sum = 0.0
+    n = 0
+    for _, row in view.iterrows():
+        qty = float(row.get("recommended_order", 0) or 0)
+        if qty <= 0:
+            continue
+        n += 1
+        price = float(row.get("purchase_price", 0) or 0)
+        amount = round(qty * price, 2)
+        total_qty += qty
+        total_sum += amount
+        vals: list = [n]
+        if include_store:
+            vals.append(safe_str(row.get("store", "")))
+        if include_supplier:
+            vals.append(safe_str(row.get("supplier_name", "")))
+        vals.extend(
+            [
+                safe_str(row.get("name", "")),
+                safe_str(row.get("barcode", "")),
+                safe_str(row.get("uom", "")),
+                qty,
+                price,
+                amount,
+            ]
+        )
+        r = n + 3
+        name_idx = 1 + int(include_store) + int(include_supplier) + 1
+        qty_idx = len(titles) - 2
+        price_idx = len(titles) - 1
+        sum_idx = len(titles)
         for c, v in enumerate(vals, 1):
-            cell = ws.cell(row=i, column=c, value=v)
+            cell = ws.cell(row=r, column=c, value=v)
             cell.border = THIN
-            if c == 3:
+            if c == name_idx:
                 cell.alignment = ALIGN_WRAP
-            if c == 7:
+            if c == qty_idx:
                 cell.fill = FILL_EDIT
+            if c in (price_idx, sum_idx):
+                cell.fill = FILL_FORMULA
+                cell.number_format = "#,##0.00"
+        ws.row_dimensions[r].height = 28
 
-    last = max(3 + len(view), 3)
-    ws.auto_filter.ref = f"A3:K{last}"
-    ws.freeze_panes = "A4"
-    if view.empty:
-        ws["A4"] = "По выбранному поставщику нет позиций с рекомендуемым заказом > 0."
-    autosize_columns(ws, name_col=3)
+    last = 3 + max(n, 1)
+    tot = last + 1 if n else 4
+    if n:
+        tot = n + 4
+        ws.cell(row=tot, column=1, value="ИТОГО")
+        for c in range(1, len(titles) + 1):
+            ws.cell(row=tot, column=c).fill = FILL_HEADER
+            ws.cell(row=tot, column=c).font = FONT_HEADER
+            ws.cell(row=tot, column=c).border = THIN
+        ws.cell(row=tot, column=len(titles) - 2, value=total_qty)
+        sum_cell = ws.cell(row=tot, column=len(titles), value=round(total_sum, 2))
+        sum_cell.number_format = "#,##0.00"
+        ws.auto_filter.ref = f"A3:{get_column_letter(len(titles))}{n + 3}"
+        ws.freeze_panes = "A4"
+    else:
+        ws["A4"] = "Нет позиций с рекомендуемым заказом > 0."
+        ws.auto_filter.ref = f"A3:{get_column_letter(len(titles))}4"
+        ws.freeze_panes = "A4"
+
+    name_col = 2 + int(include_store) + int(include_supplier)
+    autosize_columns(ws, name_col=name_col)
+    ws.column_dimensions["A"].width = 6
+
+
+def _build_store_matrix(wb: Workbook, subset: pd.DataFrame) -> None:
+    """Шахматка заказ SKU × магазин."""
+    ws = _ws(wb, "10_Матрица_заказ")
+    if subset is None or subset.empty or "store" not in subset.columns:
+        ws["A1"] = "Нет данных для матрицы по магазинам."
+        return
+    stores = sorted({safe_str(x) for x in subset["store"].tolist() if safe_str(x)})
+    headers = ["Поставщик", "Наименование", "Штрихкод"] + stores + ["Итого заказ", "Сумма, ₽"]
+    ws["A1"] = "ЗАКАЗ SKU × МАГАЗИН"
+    ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill = FILL_HEADER
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    ws["A2"] = "Пустая ячейка = заказ 0 в этой точке. Не замена листа 03_Расчёт_заказа."
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
+
+    for c, t in enumerate(headers, 1):
+        cell = ws.cell(row=3, column=c, value=t)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.border = THIN
+        cell.alignment = ALIGN_CENTER
+
+    grouped = {}
+    for _, row in subset.iterrows():
+        key = safe_str(row.get("sku_key") or row.get("sku") or row.get("name"))
+        grouped.setdefault(
+            key,
+            {
+                "supplier": safe_str(row.get("supplier_name", "")),
+                "name": safe_str(row.get("name", "")),
+                "barcode": safe_str(row.get("barcode", "")),
+                "price": float(row.get("purchase_price", 0) or 0),
+                "qty": {s: 0.0 for s in stores},
+            },
+        )
+        store = safe_str(row.get("store", ""))
+        qty = float(row.get("recommended_order", 0) or 0)
+        if store in grouped[key]["qty"]:
+            grouped[key]["qty"][store] += qty
+
+    r = 4
+    for item in sorted(grouped.values(), key=lambda x: (x["supplier"], x["name"])):
+        total = sum(item["qty"].values())
+        vals = [item["supplier"], item["name"], item["barcode"]]
+        vals.extend(item["qty"][s] or None for s in stores)
+        vals.extend([total, round(total * item["price"], 2)])
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.border = THIN
+            if c in (1, 2):
+                cell.alignment = ALIGN_WRAP
+            if 4 <= c <= 3 + len(stores) and v:
+                cell.fill = FILL_EDIT
+            if c >= len(vals) - 1:
+                cell.fill = FILL_FORMULA
+            if c == len(vals):
+                cell.number_format = "#,##0.00"
+        ws.row_dimensions[r].height = 28
+        r += 1
+    ws.freeze_panes = "D4"
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 55
+    ws.column_dimensions["C"].width = 16

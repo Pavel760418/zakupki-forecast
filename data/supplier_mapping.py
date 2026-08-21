@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
-from utils.helpers import normalize_text, safe_str
+from utils.helpers import normalize_text, safe_float, safe_str
 
 logger = logging.getLogger("zakupki_forecast.supplier_mapping")
 
@@ -32,6 +32,7 @@ COLUMN_ALIASES = {
     "article": ("артикул", "sku"),
     "code": ("код", "код номенклатуры"),
     "barcode": ("штрихкод", "штрих-код"),
+    "price": ("цена приходная", "цена закупки", "закупочная цена", "цена"),
 }
 
 
@@ -168,6 +169,9 @@ def load_supplier_mapping(path: str | Path | None = None) -> SupplierMappingResu
         barcode = (
             safe_str(raw.iat[r, col_map["barcode"]]).strip() if "barcode" in col_map else ""
         )
+        price = 0.0
+        if "price" in col_map:
+            price = safe_float(raw.iat[r, col_map["price"]], 0.0)
         if not supplier:
             continue
         if not (code or article or barcode or name):
@@ -183,6 +187,7 @@ def load_supplier_mapping(path: str | Path | None = None) -> SupplierMappingResu
                 "code": code,
                 "article": article,
                 "barcode": barcode,
+                "purchase_price": price,
                 "code_key": normalize_text(code) if code else "",
                 "article_key": normalize_text(article) if article else "",
                 "barcode_key": normalize_text(barcode) if barcode else "",
@@ -447,3 +452,66 @@ def filter_frames_by_supplier(
         info["sku_keys"],
     )
     return stock_f, sales_f, info
+
+
+def attach_supplier_attributes(
+    df: pd.DataFrame,
+    mapping: Optional[SupplierMappingResult] = None,
+) -> pd.DataFrame:
+    """Добавляет поставщика, штрихкод и цену приходную на каждую строку витрины."""
+    out = df.copy()
+    mapping = mapping or get_cached_supplier_mapping()
+    frame = mapping.frame
+    lookup: Dict[str, Dict[str, object]] = {}
+    for rec in frame.to_dict("records"):
+        payload = {
+            "supplier_name": rec.get("supplier_name", ""),
+            "barcode": rec.get("barcode", ""),
+            "purchase_price": float(rec.get("purchase_price", 0) or 0),
+        }
+        for key in (rec.get("code_key"), rec.get("article_key"), rec.get("barcode_key")):
+            k = safe_str(key).strip()
+            if k and k not in lookup:
+                lookup[k] = payload
+
+    suppliers: List[str] = []
+    barcodes: List[str] = []
+    prices: List[float] = []
+    for _, row in out.iterrows():
+        candidates = [
+            normalize_text(row.get("sku_key", "")),
+            normalize_text(row.get("sku", "")),
+            normalize_text(row.get("barcode", "")),
+            normalize_text(row.get("article", "")),
+            normalize_text(row.get("code", "")),
+        ]
+        hit = None
+        for cand in candidates:
+            if cand and cand in lookup:
+                hit = lookup[cand]
+                break
+        if hit:
+            suppliers.append(safe_str(hit["supplier_name"]))
+            barcodes.append(safe_str(row.get("barcode")) or safe_str(hit["barcode"]))
+            price = float(hit["purchase_price"] or 0)
+        else:
+            suppliers.append("Не сопоставлен")
+            barcodes.append(safe_str(row.get("barcode")))
+            price = 0.0
+        if price <= 0:
+            stock = float(row.get("stock", 0) or 0)
+            stock_amt = float(row.get("stock_amount", 0) or 0)
+            sales_qty = float(row.get("sales_qty", 0) or 0)
+            sales_amt = float(row.get("sales_amount", 0) or 0)
+            if stock > 0 and stock_amt > 0:
+                price = round(stock_amt / stock, 4)
+            elif sales_qty > 0 and sales_amt > 0:
+                price = round(sales_amt / sales_qty, 4)
+        prices.append(price)
+
+    out["supplier_name"] = suppliers
+    out["barcode"] = barcodes
+    out["purchase_price"] = prices
+    out["order_sum"] = out.get("recommended_order", 0) * out["purchase_price"] if "recommended_order" in out.columns else 0.0
+    return out
+
