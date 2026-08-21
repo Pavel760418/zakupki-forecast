@@ -57,10 +57,66 @@ def _save_upload(uploaded_file) -> Path:
 
 
 @st.cache_data(show_spinner=False)
-def _load_supplier_options() -> list[str]:
-    """Полный список поставщиков для UI (кэш Streamlit)."""
-    mapping = get_cached_supplier_mapping()
-    return [SUPPLIER_NONE_LABEL, *list_suppliers(mapping)]
+def _load_supplier_options() -> tuple[str, ...]:
+    """Стабильный tuple опций для selectbox (кэш Streamlit)."""
+    try:
+        mapping = get_cached_supplier_mapping()
+        names = [safe for safe in (str(x).strip() for x in list_suppliers(mapping)) if safe]
+        # Уникальные, порядок сохранён
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            if name not in seen and name != SUPPLIER_NONE_LABEL:
+                seen.add(name)
+                uniq.append(name)
+        return (SUPPLIER_NONE_LABEL, *uniq)
+    except Exception:
+        return (SUPPLIER_NONE_LABEL,)
+
+
+def _render_supplier_block() -> str | None:
+    """
+    Опциональный выбор поставщика.
+
+    Важно для Streamlit Cloud:
+    - не смешивать index= и key= у selectbox;
+    - не менять дерево виджетов между успешным/ошибочным путём;
+    - выбирать по индексу (имена поставщиков содержат кавычки и ломают DOM).
+    """
+    st.subheader("4. Поставщик (опционально)")
+    st.caption(
+        "По умолчанию выполняется общий расчёт. Выбор поставщика не обязателен "
+        "и фильтрует SKU по файлу привязки. Отсутствие остатков в файле не блокирует расчёт."
+    )
+
+    labels = list(_load_supplier_options())
+    if not labels:
+        labels = [SUPPLIER_NONE_LABEL]
+
+    st.caption(f"В справочнике привязки: **{max(0, len(labels) - 1)}** поставщиков.")
+
+    # Выбор по индексу — устойчивее для React DOM (имена с «"» внутри).
+    idx_key = "supplier_select_idx"
+    st.session_state.pop("supplier_select", None)  # старый key с текстом опции
+    current_idx = st.session_state.get(idx_key, 0)
+    if not isinstance(current_idx, int) or current_idx < 0 or current_idx >= len(labels):
+        st.session_state[idx_key] = 0
+
+    selected_idx = st.selectbox(
+        "Поставщик для расчёта заказа",
+        options=list(range(len(labels))),
+        format_func=lambda i: labels[i],
+        key=idx_key,
+        help="Оставьте «Не выбран / общий расчёт», чтобы посчитать всю номенклатуру.",
+    )
+    selected_supplier = labels[int(selected_idx)]
+
+    if selected_supplier != SUPPLIER_NONE_LABEL:
+        st.info(f"Режим: расчёт по поставщику **{selected_supplier}**")
+        return selected_supplier
+
+    st.info("Режим: **все контрагенты** (поставщик будет указан в строке товара)")
+    return None
 
 
 def main() -> None:
@@ -228,42 +284,12 @@ def main() -> None:
             step=0.1,
         )
 
-    st.subheader("4. Поставщик (опционально)")
-    st.caption(
-        "По умолчанию выполняется общий расчёт. Выбор поставщика не обязателен "
-        "и фильтрует SKU по файлу привязки. Отсутствие остатков в файле не блокирует расчёт."
-    )
-    try:
-        supplier_options = _load_supplier_options()
-        st.caption(f"В справочнике привязки: **{len(supplier_options) - 1}** поставщиков.")
-    except Exception as exc:
-        st.warning(
-            "Файл привязки SKU к поставщику недоступен. "
-            f"Доступен только общий расчёт. Детали: {exc}"
-        )
-        supplier_options = [SUPPLIER_NONE_LABEL]
-    selected_supplier = st.selectbox(
-        "Поставщик для расчёта заказа",
-        options=supplier_options,
-        index=0,
-        key="supplier_select",
-        help="Оставьте «Не выбран / общий расчёт», чтобы посчитать всю номенклатуру.",
-    )
-    supplier_mode = (
-        selected_supplier
-        if selected_supplier and selected_supplier != SUPPLIER_NONE_LABEL
-        else None
-    )
-    if supplier_mode:
-        st.info(f"Режим: расчёт по поставщику **{supplier_mode}**")
-    else:
-        st.info("Режим: **все контрагенты** (поставщик будет указан в строке товара)")
+    supplier_mode = _render_supplier_block()
 
     st.subheader("5. Детализация")
     grain_label = st.radio(
         "Как формировать заказ",
         options=["Сводно по сети", "По магазинам / подразделениям"],
-        index=0,
         key="grain_select",
         help="Сводно — одна строка на товар по всей сети. По магазинам — отдельная потребность Адлера, Флагмана, Сочи и т.д.",
     )
