@@ -127,7 +127,8 @@ def _render_supplier_block() -> str | None:
         st.info(f"Режим: расчёт по поставщику **{picked}**")
         if st.button("Сменить поставщика", key="supplier_clear_v5"):
             st.session_state.pop("supplier_picked_v5", None)
-            st.rerun()
+            st.session_state["supplier_search_v5"] = ""
+            return None
         return str(picked)
 
     query = st.text_input(
@@ -146,9 +147,11 @@ def _render_supplier_block() -> str | None:
     st.caption("Нажмите на нужного поставщика:" + (f" показано {min(len(matches), 30)} из {len(matches)}" if len(matches) > 30 else ""))
     for i, real in enumerate(matches[:30]):
         disp = _supplier_display_label(real, i)
-        if st.button(disp, key=f"supplier_btn_v5_{i}", use_container_width=True):
+        # Стабильный key от имени поставщика, чтобы React не путал узлы при фильтрации списка.
+        stable_key = f"supplier_btn_v6_{abs(hash(real))}"
+        if st.button(disp, key=stable_key, use_container_width=True):
             st.session_state["supplier_picked_v5"] = real
-            st.rerun()
+            return str(real)
 
     st.info("Режим: **все контрагенты** — поставщик ещё не выбран (включите фильтр и нажмите на имя).")
     return None
