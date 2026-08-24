@@ -91,15 +91,14 @@ def _render_supplier_block() -> str | None:
     """
     Опциональный выбор поставщика.
 
-    Обход бага Streamlit Cloud (React removeChild на BaseWeb Select/Radio):
-    - на старте тяжёлые виджеты списка НЕ создаём;
-    - выбор через checkbox + поиск + кнопки (без selectbox);
-    - в подписях убираем ASCII-кавычки.
+    Максимально простой UI без selectbox/radio/кнопок-списка:
+    на Streamlit Cloud BaseWeb Select и динамические кнопки дают React removeChild.
     """
     st.subheader("4. Поставщик (опционально)")
     st.caption(
-        "По умолчанию выполняется общий расчёт. Выбор поставщика не обязателен "
-        "и фильтрует SKU по файлу привязки. Отсутствие остатков в файле не блокирует расчёт."
+        "По умолчанию — общий расчёт по всем контрагентам. "
+        "Чтобы ограничить одним поставщиком, включите галочку и введите имя "
+        "(можно часть названия, например: Альтаир или Орион)."
     )
 
     labels = list(_load_supplier_options()) or [SUPPLIER_NONE_LABEL]
@@ -109,52 +108,47 @@ def _render_supplier_block() -> str | None:
     filter_on = st.checkbox(
         "Ограничить расчёт одним поставщиком",
         value=False,
-        key="supplier_filter_on_v5",
-        help="Включите, чтобы выбрать контрагента из списка.",
+        key="supplier_filter_on_v7",
+        help="Включите и введите имя поставщика в поле ниже.",
     )
     if not filter_on:
-        st.session_state.pop("supplier_picked_v5", None)
-        st.info("Режим: **все контрагенты** (поставщик будет указан в строке товара)")
+        st.info("Режим: все контрагенты (поставщик будет указан в строке товара)")
         return None
 
     if not real_suppliers:
         st.warning("Справочник поставщиков пуст — доступен только общий расчёт.")
-        st.info("Режим: **все контрагенты** (поставщик будет указан в строке товара)")
         return None
-
-    picked = st.session_state.get("supplier_picked_v5")
-    if picked and picked in real_suppliers:
-        st.info(f"Режим: расчёт по поставщику **{picked}**")
-        if st.button("Сменить поставщика", key="supplier_clear_v5"):
-            st.session_state.pop("supplier_picked_v5", None)
-            st.session_state["supplier_search_v5"] = ""
-            return None
-        return str(picked)
 
     query = st.text_input(
-        "Поиск поставщика",
+        "Имя поставщика (часть названия)",
         value="",
-        key="supplier_search_v5",
-        placeholder="Начните вводить название…",
-    )
-    q = query.strip().casefold()
-    matches = [n for n in real_suppliers if q in n.casefold()] if q else list(real_suppliers)
-    if not matches:
-        st.warning("Ничего не найдено. Измените строку поиска.")
-        st.info("Режим: **все контрагенты** (поставщик будет указан в строке товара)")
+        key="supplier_search_v7",
+        placeholder="Например: Альтаир",
+    ).strip()
+    if not query:
+        st.warning("Введите часть названия поставщика или снимите галочку.")
         return None
 
-    st.caption("Нажмите на нужного поставщика:" + (f" показано {min(len(matches), 30)} из {len(matches)}" if len(matches) > 30 else ""))
-    for i, real in enumerate(matches[:30]):
-        disp = _supplier_display_label(real, i)
-        # Стабильный key от имени поставщика, чтобы React не путал узлы при фильтрации списка.
-        stable_key = f"supplier_btn_v6_{abs(hash(real))}"
-        if st.button(disp, key=stable_key, use_container_width=True):
-            st.session_state["supplier_picked_v5"] = real
-            return str(real)
+    q = query.casefold()
+    matches = [n for n in real_suppliers if q in n.casefold()]
+    if not matches:
+        st.warning("Поставщик не найден в справочнике. Проверьте написание.")
+        return None
 
-    st.info("Режим: **все контрагенты** — поставщик ещё не выбран (включите фильтр и нажмите на имя).")
-    return None
+    # Берём точное совпадение, иначе единственный матч, иначе первый по алфавиту.
+    exact = [n for n in matches if n.casefold() == q]
+    if exact:
+        chosen = exact[0]
+    elif len(matches) == 1:
+        chosen = matches[0]
+    else:
+        chosen = sorted(matches)[0]
+        preview = "; ".join(_supplier_display_label(n, i) for i, n in enumerate(matches[:8]))
+        st.caption(f"Найдено несколько: {preview}" + ("…" if len(matches) > 8 else ""))
+        st.caption(f"Для расчёта выбран: {_supplier_display_label(chosen, 0)}. Уточните ввод, если нужен другой.")
+
+    st.info(f"Режим: расчёт по поставщику **{chosen}**")
+    return str(chosen)
 
 
 def main() -> None:
@@ -165,7 +159,7 @@ def main() -> None:
         "поставщик на каждой позиции, отдельный лист заявки — всегда."
     )
 
-    with st.expander("📘 Как пользоваться (пошагово)", expanded=True):
+    with st.expander("📘 Как пользоваться (пошагово)", expanded=False):
         st.markdown(
             """
 **Что нового в четвёртом релизе.**
@@ -299,11 +293,8 @@ def main() -> None:
             dmin, dmax = detect_sales_date_range(sales_preview)
             date_from_default = dmin.date()
             date_to_default = dmax.date()
-            file_stamp = f"{sales_file.name}:{sales_file.size}"
-            if st.session_state.get("sales_stamp") != file_stamp:
-                st.session_state["sales_stamp"] = file_stamp
-                st.session_state["date_from"] = date_from_default
-                st.session_state["date_to"] = date_to_default
+            # Не пишем в session_state ключи date_from/date_to в том же прогоне,
+            # где создаются date_input — это даёт React removeChild на Cloud.
             st.info(f"В файле продаж найден период: **{dmin.date()} — {dmax.date()}**")
         except Exception as exc:
             st.warning(f"Файл продаж пока не удалось прочитать: {exc}")
@@ -311,9 +302,9 @@ def main() -> None:
     st.subheader("3. Период расчёта")
     col1, col2 = st.columns(2)
     with col1:
-        date_from = st.date_input("Дата начала", value=date_from_default, key="date_from")
+        date_from = st.date_input("Дата начала", value=date_from_default)
     with col2:
-        date_to = st.date_input("Дата окончания", value=date_to_default, key="date_to")
+        date_to = st.date_input("Дата окончания", value=date_to_default)
 
     col3, col4 = st.columns(2)
     with col3:
