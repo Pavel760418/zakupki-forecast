@@ -58,7 +58,7 @@ def _save_upload(uploaded_file) -> Path:
 
 @st.cache_data(show_spinner=False)
 def _load_supplier_options() -> tuple[str, ...]:
-    """Стабильный tuple опций для UI (кэш Streamlit)."""
+    """Стабильный tuple опций для selectbox (кэш Streamlit)."""
     try:
         mapping = get_cached_supplier_mapping()
         names = [safe for safe in (str(x).strip() for x in list_suppliers(mapping)) if safe]
@@ -138,74 +138,45 @@ def _sync_dates_from_sales(sales_file) -> None:
 
 def _render_supplier_block() -> str | None:
     """
-    Опциональный выбор поставщика.
+    Опциональный выбор поставщика — выпадающий список.
 
-    Виджеты всегда одни и те же (checkbox + text_input): условное создание
-    text_input на Cloud даёт React removeChild при перерисовке после upload.
+    Для Streamlit Cloud (BaseWeb Select / removeChild):
+    - опции по индексу, а не по сырому имени с кавычками;
+    - подписи без ASCII-кавычек;
+    - один стабильный selectbox каждый прогон (без условного дерева);
+    - статус через caption, не через условный st.info.
     """
     st.subheader("4. Поставщик (опционально)")
     st.caption(
         "По умолчанию — общий расчёт по всем контрагентам. "
-        "Чтобы ограничить одним поставщиком, включите галочку и введите имя "
-        "(можно часть названия, например: Альтаир или Орион)."
+        "Чтобы ограничить одним поставщиком, выберите его в списке ниже."
     )
 
     labels = list(_load_supplier_options()) or [SUPPLIER_NONE_LABEL]
-    real_suppliers = [x for x in labels if x != SUPPLIER_NONE_LABEL]
-    st.caption(f"В справочнике привязки: {len(real_suppliers)} поставщиков.")
+    display = [_supplier_display_label(name, i) for i, name in enumerate(labels)]
+    st.caption(f"В справочнике привязки: {max(0, len(labels) - 1)} поставщиков.")
 
-    filter_on = st.checkbox(
-        "Ограничить расчёт одним поставщиком",
-        value=False,
-        key="supplier_filter_on_v8",
-        help="Включите и введите имя поставщика в поле ниже.",
+    idx_key = "supplier_select_idx_v9"
+    # Старые ключи checkbox/поиска не трогаем в том же прогоне — только новый selectbox.
+    current_idx = st.session_state.get(idx_key, 0)
+    if not isinstance(current_idx, int) or current_idx < 0 or current_idx >= len(labels):
+        st.session_state[idx_key] = 0
+
+    selected_idx = st.selectbox(
+        "Поставщик для расчёта заказа",
+        options=list(range(len(labels))),
+        format_func=lambda i: display[i],
+        key=idx_key,
+        help="Оставьте «Не выбран / общий расчёт», чтобы посчитать всю номенклатуру.",
     )
-    query = st.text_input(
-        "Имя поставщика (часть названия)",
-        key="supplier_search_v8",
-        placeholder="Например: Альтаир",
-        disabled=not filter_on,
-    )
-    query = (query or "").strip()
+    selected_supplier = labels[int(selected_idx)]
 
-    status = "Режим: все контрагенты (поставщик будет указан в строке товара)"
-    chosen: str | None = None
+    if selected_supplier != SUPPLIER_NONE_LABEL:
+        st.caption(f"Режим: расчёт по поставщику {_supplier_display_label(selected_supplier, 0)}")
+        return str(selected_supplier)
 
-    if not filter_on:
-        st.caption(status)
-        return None
-
-    if not real_suppliers:
-        st.caption("Справочник поставщиков пуст — доступен только общий расчёт.")
-        return None
-
-    if not query:
-        st.caption("Введите часть названия поставщика или снимите галочку.")
-        return None
-
-    q = query.casefold()
-    matches = [n for n in real_suppliers if q in n.casefold()]
-    if not matches:
-        st.caption("Поставщик не найден в справочнике. Проверьте написание.")
-        return None
-
-    exact = [n for n in matches if n.casefold() == q]
-    if exact:
-        chosen = exact[0]
-    elif len(matches) == 1:
-        chosen = matches[0]
-    else:
-        chosen = sorted(matches)[0]
-        preview = "; ".join(_supplier_display_label(n, i) for i, n in enumerate(matches[:8]))
-        st.caption(
-            f"Найдено несколько: {preview}"
-            + ("…" if len(matches) > 8 else "")
-            + f". Для расчёта выбран: {_supplier_display_label(chosen, 0)}. "
-            "Уточните ввод, если нужен другой."
-        )
-
-    st.caption(f"Режим: расчёт по поставщику {_supplier_display_label(chosen, 0)}")
-    return str(chosen)
+    st.caption("Режим: все контрагенты (поставщик будет указан в строке товара)")
+    return None
 
 
 def main() -> None:
