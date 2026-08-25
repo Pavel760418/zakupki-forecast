@@ -87,12 +87,61 @@ def _supplier_display_label(name: str, idx: int) -> str:
     return text or f"Поставщик #{idx}"
 
 
+def _ensure_date_state() -> None:
+    """Инициализация дат в session_state до создания date_input."""
+    if "ui_date_from" not in st.session_state:
+        st.session_state.ui_date_from = date.today() - timedelta(
+            days=SETTINGS["default_sales_period_days"] - 1
+        )
+    if "ui_date_to" not in st.session_state:
+        st.session_state.ui_date_to = date.today()
+    st.session_state.setdefault("ui_sales_stamp", None)
+    st.session_state.setdefault("ui_sales_period_msg", "")
+    st.session_state.setdefault("ui_sales_period_err", "")
+
+
+def _sync_dates_from_sales(sales_file) -> None:
+    """
+    После новой загрузки продаж обновляет даты через session_state и делает rerun.
+
+    Важно: не трогаем session_state ключей date_input в том же прогоне, где виджет
+    уже создан — на Streamlit Cloud это даёт React removeChild.
+    """
+    if sales_file is None:
+        if st.session_state.get("ui_sales_stamp") is not None:
+            st.session_state.ui_sales_stamp = None
+            st.session_state.ui_sales_period_msg = ""
+            st.session_state.ui_sales_period_err = ""
+        return
+
+    stamp = f"{getattr(sales_file, 'name', 'sales')}:{getattr(sales_file, 'size', 0)}"
+    if st.session_state.get("ui_sales_stamp") == stamp:
+        return
+
+    try:
+        sales_path = _save_upload(sales_file)
+        sales_preview = load_sales_file(sales_path)
+        dmin, dmax = detect_sales_date_range(sales_preview)
+        st.session_state.ui_date_from = dmin.date()
+        st.session_state.ui_date_to = dmax.date()
+        st.session_state.ui_sales_period_msg = (
+            f"В файле продаж найден период: {dmin.date()} — {dmax.date()}"
+        )
+        st.session_state.ui_sales_period_err = ""
+        st.session_state.ui_sales_stamp = stamp
+    except Exception as exc:
+        st.session_state.ui_sales_period_msg = ""
+        st.session_state.ui_sales_period_err = f"Файл продаж пока не удалось прочитать: {exc}"
+        st.session_state.ui_sales_stamp = stamp
+    st.rerun()
+
+
 def _render_supplier_block() -> str | None:
     """
     Опциональный выбор поставщика.
 
-    Максимально простой UI без selectbox/radio/кнопок-списка:
-    на Streamlit Cloud BaseWeb Select и динамические кнопки дают React removeChild.
+    Виджеты всегда одни и те же (checkbox + text_input): условное создание
+    text_input на Cloud даёт React removeChild при перерисовке после upload.
     """
     st.subheader("4. Поставщик (опционально)")
     st.caption(
@@ -103,39 +152,43 @@ def _render_supplier_block() -> str | None:
 
     labels = list(_load_supplier_options()) or [SUPPLIER_NONE_LABEL]
     real_suppliers = [x for x in labels if x != SUPPLIER_NONE_LABEL]
-    st.caption(f"В справочнике привязки: **{len(real_suppliers)}** поставщиков.")
+    st.caption(f"В справочнике привязки: {len(real_suppliers)} поставщиков.")
 
     filter_on = st.checkbox(
         "Ограничить расчёт одним поставщиком",
         value=False,
-        key="supplier_filter_on_v7",
+        key="supplier_filter_on_v8",
         help="Включите и введите имя поставщика в поле ниже.",
     )
+    query = st.text_input(
+        "Имя поставщика (часть названия)",
+        key="supplier_search_v8",
+        placeholder="Например: Альтаир",
+        disabled=not filter_on,
+    )
+    query = (query or "").strip()
+
+    status = "Режим: все контрагенты (поставщик будет указан в строке товара)"
+    chosen: str | None = None
+
     if not filter_on:
-        st.info("Режим: все контрагенты (поставщик будет указан в строке товара)")
+        st.caption(status)
         return None
 
     if not real_suppliers:
-        st.warning("Справочник поставщиков пуст — доступен только общий расчёт.")
+        st.caption("Справочник поставщиков пуст — доступен только общий расчёт.")
         return None
 
-    query = st.text_input(
-        "Имя поставщика (часть названия)",
-        value="",
-        key="supplier_search_v7",
-        placeholder="Например: Альтаир",
-    ).strip()
     if not query:
-        st.warning("Введите часть названия поставщика или снимите галочку.")
+        st.caption("Введите часть названия поставщика или снимите галочку.")
         return None
 
     q = query.casefold()
     matches = [n for n in real_suppliers if q in n.casefold()]
     if not matches:
-        st.warning("Поставщик не найден в справочнике. Проверьте написание.")
+        st.caption("Поставщик не найден в справочнике. Проверьте написание.")
         return None
 
-    # Берём точное совпадение, иначе единственный матч, иначе первый по алфавиту.
     exact = [n for n in matches if n.casefold() == q]
     if exact:
         chosen = exact[0]
@@ -144,10 +197,14 @@ def _render_supplier_block() -> str | None:
     else:
         chosen = sorted(matches)[0]
         preview = "; ".join(_supplier_display_label(n, i) for i, n in enumerate(matches[:8]))
-        st.caption(f"Найдено несколько: {preview}" + ("…" if len(matches) > 8 else ""))
-        st.caption(f"Для расчёта выбран: {_supplier_display_label(chosen, 0)}. Уточните ввод, если нужен другой.")
+        st.caption(
+            f"Найдено несколько: {preview}"
+            + ("…" if len(matches) > 8 else "")
+            + f". Для расчёта выбран: {_supplier_display_label(chosen, 0)}. "
+            "Уточните ввод, если нужен другой."
+        )
 
-    st.info(f"Режим: расчёт по поставщику **{chosen}**")
+    st.caption(f"Режим: расчёт по поставщику {_supplier_display_label(chosen, 0)}")
     return str(chosen)
 
 
@@ -273,38 +330,35 @@ def main() -> None:
     stock_file = st.file_uploader(
         "Выберите Excel с остатками",
         type=["xlsx", "xlsm", "xls"],
-        key="stock",
+        key="stock_v8",
     )
 
     st.subheader("2. Файл продаж")
     sales_file = st.file_uploader(
         "Выберите Excel с продажами",
         type=["xlsx", "xlsm", "xls"],
-        key="sales",
+        key="sales_v8",
     )
 
-    date_from_default = date.today() - timedelta(days=SETTINGS["default_sales_period_days"] - 1)
-    date_to_default = date.today()
+    _ensure_date_state()
+    # Обновление дат только через session_state + rerun ДО date_input (иначе removeChild).
+    _sync_dates_from_sales(sales_file)
 
-    if sales_file is not None:
-        try:
-            sales_path_preview = _save_upload(sales_file)
-            sales_preview = load_sales_file(sales_path_preview)
-            dmin, dmax = detect_sales_date_range(sales_preview)
-            date_from_default = dmin.date()
-            date_to_default = dmax.date()
-            # Не пишем в session_state ключи date_from/date_to в том же прогоне,
-            # где создаются date_input — это даёт React removeChild на Cloud.
-            st.info(f"В файле продаж найден период: **{dmin.date()} — {dmax.date()}**")
-        except Exception as exc:
-            st.warning(f"Файл продаж пока не удалось прочитать: {exc}")
+    period_msg = st.session_state.get("ui_sales_period_msg") or ""
+    period_err = st.session_state.get("ui_sales_period_err") or ""
+    if period_msg:
+        st.caption(period_msg)
+    elif period_err:
+        st.caption(period_err)
+    else:
+        st.caption("После загрузки файла продаж сюда подставится период.")
 
     st.subheader("3. Период расчёта")
     col1, col2 = st.columns(2)
     with col1:
-        date_from = st.date_input("Дата начала", value=date_from_default)
+        date_from = st.date_input("Дата начала", key="ui_date_from")
     with col2:
-        date_to = st.date_input("Дата окончания", value=date_to_default)
+        date_to = st.date_input("Дата окончания", key="ui_date_to")
 
     col3, col4 = st.columns(2)
     with col3:
@@ -314,6 +368,7 @@ def main() -> None:
             max_value=366,
             value=int(SETTINGS["default_order_period_days"]),
             step=1,
+            key="order_days_input_v8",
         )
     with col4:
         order_coef = st.number_input(
@@ -327,7 +382,7 @@ def main() -> None:
                 "Больше 1 — повышающий (акции/сезон), меньше 1 — понижающий. "
                 "Пишется в Excel «01_Настройки»!B7 и участвует в формулах листа 03."
             ),
-            key="order_coef_input",
+            key="order_coef_input_v8",
         )
 
     supplier_mode = _render_supplier_block()
@@ -336,17 +391,18 @@ def main() -> None:
     grain_label = st.radio(
         "Как формировать заказ",
         options=["Сводно по сети", "По магазинам / подразделениям"],
-        key="grain_select",
+        key="grain_select_v8",
         help="Сводно — одна строка на товар по всей сети. По магазинам — отдельная потребность Адлера, Флагмана, Сочи и т.д.",
     )
     grain = GRAIN_STORE if grain_label.startswith("По магазинам") else GRAIN_NETWORK
-    if grain == GRAIN_STORE:
-        st.info("Детализация: **по магазинам**. Если в файлах нет склада/подразделения, модуль останется сводным.")
-    else:
-        st.info("Детализация: **сводно по сети**")
+    st.caption(
+        "Детализация: по магазинам. Если в файлах нет склада/подразделения, модуль останется сводным."
+        if grain == GRAIN_STORE
+        else "Детализация: сводно по сети"
+    )
 
     st.subheader("6. Запуск")
-    run = st.button("Сформировать Excel", type="primary", use_container_width=True)
+    run = st.button("Сформировать Excel", type="primary", use_container_width=True, key="run_btn_v8")
 
     if not run:
         return
