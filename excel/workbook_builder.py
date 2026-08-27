@@ -122,7 +122,7 @@ def build_workbook(
     output_path: str | Path | None = None,
     supplier_name: str | None = None,
 ) -> Path:
-    """Создаёт итоговый xlsx (4 релиз): расчёт + упрощённый заказ поставщику."""
+    """Создаёт итоговый xlsx (5 релиз): расчёт + заказ + перемещения ЦС и магазин↔магазин."""
     resolved_supplier = safe_str(supplier_name).strip() if supplier_name else ""
     if not resolved_supplier:
         resolved_supplier = safe_str(meta.get("supplier_name", "")).strip()
@@ -171,6 +171,12 @@ def build_workbook(
         _build_store_matrix(wb, matrix_source)
         transfers = meta.get("transfers")
         _build_transfer_sheet(wb, transfers if isinstance(transfers, pd.DataFrame) else None, meta)
+        store_transfers = meta.get("store_transfers")
+        _build_store_to_store_transfer_sheet(
+            wb,
+            store_transfers if isinstance(store_transfers, pd.DataFrame) else None,
+            meta,
+        )
 
     wb.save(output_path)
     logger.info("Excel сохранён: %s", output_path)
@@ -223,7 +229,14 @@ def _build_instruction(
             11,
         ),
         (
-            "Четвёртый релиз: в расчёте видны магазин, поставщик, штрихкод и цена. "
+            "12_Перемещение_магазин_магазин — межмагазинные перемещения по оборачиваемости: "
+            "из точки с перетаркой в точку с потребностью по продажам того же SKU; "
+            "если спрос оценить нельзя (нулевой остаток и нет продаж) — один квант.",
+            False,
+            11,
+        ),
+        (
+            "Пятый релиз: плюс лист межмагазинных перемещений. "
             f"Детализация этой книги: {'по магазинам' if grain == GRAIN_STORE else 'сводно по сети'}.",
             False,
             11,
@@ -1221,3 +1234,138 @@ def _build_transfer_sheet(
     autosize_columns(ws, name_col=6)
     ws.column_dimensions["A"].width = 6
     ws.column_dimensions["F"].width = 55
+
+
+def _build_store_to_store_transfer_sheet(
+    wb: Workbook,
+    transfers: pd.DataFrame | None,
+    meta: Dict[str, Any],
+) -> None:
+    """Лист перемещений магазин → магазин (после разноски с ЦС)."""
+    ws = _ws(wb, "12_Перемещение_магазин_магазин")
+    ws["A1"] = "ПЕРЕМЕСТИТЬ С МАГАЗИНА НА МАГАЗИН (по оборачиваемости)"
+    ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill = FILL_HEADER
+
+    titles = [
+        "№",
+        "Из магазина",
+        "В магазин",
+        "Приоритет",
+        "Артикул",
+        "Наименование",
+        "Штрихкод",
+        "Ед.",
+        "Квант",
+        "Кол-во переместить",
+        "Основание",
+        "Потребность / квант",
+        "Остаток получателя до",
+        "Остаток отправителя до",
+        "Остаток отправителя после",
+        "Покрытие отправителя до, дни",
+        "Заказ получателя после",
+        "Продажи SKU у получателя",
+        "Поставщик",
+        "Цена",
+        "Сумма (справка)",
+        "Альтернативный поставщик",
+    ]
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(titles))
+    ws["A2"] = (
+        "Сначала закрываем дефицит с «Склад основной» (лист 11), затем смотрим перетарку между магазинами. "
+        "Объём — по продажам магазина-получателя (полные кванты). "
+        "Если у получателя нулевой остаток и нет продаж — один квант. "
+        f"Строк: {int(meta.get('store_transfer_lines', 0) or 0)}, "
+        f"всего шт: {float(meta.get('store_transfer_qty_total', 0) or 0):.0f}."
+    )
+    ws["A2"].alignment = ALIGN_WRAP
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(titles))
+    ws.row_dimensions[2].height = 42
+
+    for c, t in enumerate(titles, 1):
+        cell = ws.cell(row=3, column=c, value=t)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.border = THIN
+        cell.alignment = ALIGN_CENTER
+
+    if transfers is None or transfers.empty:
+        ws["A4"] = (
+            "Нет предложений по межмагазинному перемещению: нет пар "
+            "«перетарка в одном магазине + потребность / нулевой остаток в другом» "
+            "по одним и тем же SKU, либо детализация не по магазинам."
+        )
+        ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=len(titles))
+        autosize_columns(ws, name_col=6)
+        return
+
+    view = transfers.sort_values(
+        ["priority_rank", "from_store", "to_store", "name"],
+        ascending=[True, True, True, True],
+    )
+    total_qty = 0.0
+    total_sum = 0.0
+    n = 0
+    for _, row in view.iterrows():
+        qty = float(row.get("transfer_qty", 0) or 0)
+        if qty <= 0:
+            continue
+        n += 1
+        price = float(row.get("purchase_price", 0) or 0)
+        amount = round(qty * price, 2)
+        total_qty += qty
+        total_sum += amount
+        vals = [
+            n,
+            safe_str(row.get("from_store", "")),
+            safe_str(row.get("to_store", "")),
+            int(row.get("priority_rank", 0) or 0),
+            safe_str(row.get("sku", "")),
+            safe_str(row.get("name", "")),
+            safe_str(row.get("barcode", "")),
+            safe_str(row.get("uom", "")),
+            int(row.get("quantum", 1) or 1),
+            qty,
+            safe_str(row.get("reason", "")),
+            float(row.get("need_before", 0) or 0),
+            float(row.get("to_stock_before", 0) or 0),
+            float(row.get("from_stock_before", 0) or 0),
+            float(row.get("from_stock_after", 0) or 0),
+            float(row.get("from_cover_before", 0) or 0),
+            float(row.get("order_after", 0) or 0),
+            float(row.get("sales_qty", 0) or 0),
+            safe_str(row.get("supplier_name", "")),
+            price,
+            amount,
+            safe_str(row.get("alt_supplier", "")),
+        ]
+        r = n + 3
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.border = THIN
+            if c == 6:
+                cell.alignment = ALIGN_WRAP
+            if c in (9, 10):
+                cell.fill = FILL_EDIT
+            if c in (20, 21):
+                cell.fill = FILL_FORMULA
+                cell.number_format = "#,##0.00"
+        ws.row_dimensions[r].height = 28
+
+    tot = n + 4
+    ws.cell(row=tot, column=1, value="ИТОГО")
+    for c in range(1, len(titles) + 1):
+        ws.cell(row=tot, column=c).fill = FILL_HEADER
+        ws.cell(row=tot, column=c).font = FONT_HEADER
+        ws.cell(row=tot, column=c).border = THIN
+    ws.cell(row=tot, column=10, value=total_qty)
+    sum_cell = ws.cell(row=tot, column=21, value=round(total_sum, 2))
+    sum_cell.number_format = "#,##0.00"
+
+    ws.auto_filter.ref = f"A3:{get_column_letter(len(titles))}{n + 3}"
+    ws.freeze_panes = "A4"
+    autosize_columns(ws, name_col=6)
+    ws.column_dimensions["A"].width = 6
+    ws.column_dimensions["F"].width = 55
+    ws.column_dimensions["K"].width = 28
