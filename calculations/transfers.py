@@ -242,3 +242,250 @@ def apply_central_warehouse_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, p
         float(transfers_df["transfer_qty"].sum()) if not transfers_df.empty else 0.0,
     )
     return out, transfers_df
+
+
+def _surplus_qty(stock: float, avg_daily: float, overstock_days: float) -> float:
+    """Сколько шт можно отдать, оставив покрытие ≤ порога избытка (или весь остаток без продаж)."""
+    stock = max(0.0, float(stock or 0))
+    avg_daily = max(0.0, float(avg_daily or 0))
+    if stock <= 0:
+        return 0.0
+    if avg_daily <= 0:
+        # Нет оборачиваемости в точке — весь остаток считается перетаркой/неликвидом для межмагазина.
+        return stock
+    keep = avg_daily * float(overstock_days)
+    return max(0.0, stock - keep)
+
+
+def apply_store_to_store_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Межмагазинные перемещения по оборачиваемости (после разноски с ЦС).
+
+    Источник — точка с перетаркой (покрытие выше порога избытка или остаток без продаж).
+    Получатель — точка с потребностью по продажам того же SKU.
+    Если у получателя нулевой остаток и нет продаж (нельзя оценить объём) —
+    предлагается переместить один квант.
+    """
+    out = df.copy()
+    empty = pd.DataFrame(
+        columns=[
+            "from_store",
+            "to_store",
+            "priority_rank",
+            "sku",
+            "sku_key",
+            "name",
+            "barcode",
+            "uom",
+            "quantum",
+            "transfer_qty",
+            "need_before",
+            "to_stock_before",
+            "from_stock_before",
+            "from_stock_after",
+            "from_cover_before",
+            "order_after",
+            "sales_qty",
+            "reason",
+            "supplier_name",
+            "purchase_price",
+            "alt_supplier",
+        ]
+    )
+
+    if out.empty or "store" not in out.columns or "sku_key" not in out.columns:
+        return out, empty
+
+    if "transfer_in" not in out.columns:
+        out["transfer_in"] = 0.0
+    if "transfer_out" not in out.columns:
+        out["transfer_out"] = 0.0
+
+    out["store"] = out["store"].map(lambda x: canon_store_name(x) if safe_str(x).strip() else safe_str(x))
+    retail_mask = out["store"].map(_is_retail_dest)
+    if not bool(retail_mask.any()):
+        return out, empty
+
+    over_days = float(SETTINGS.get("overstock_cover_days", 60) or 60)
+    round_up = bool(SETTINGS.get("round_order_up", True))
+    min_stock_target = float(SETTINGS.get("min_stock_target", 0) or 0)
+
+    if "avg_daily_sales" not in out.columns:
+        out["avg_daily_sales"] = 0.0
+    if "cover_days" not in out.columns:
+        out["cover_days"] = 0.0
+    if "sales_qty" not in out.columns:
+        out["sales_qty"] = 0.0
+
+    transfers: List[dict] = []
+    sku_keys = out.loc[retail_mask, "sku_key"].dropna().unique().tolist()
+
+    for sku_key in sku_keys:
+        idxs = out.index[retail_mask & (out["sku_key"] == sku_key)].tolist()
+        if len(idxs) < 2:
+            continue
+
+        # Источники: избыток / нет продаж при остатке; сами не нуждаются в заказе.
+        sources: List[Tuple[float, int]] = []
+        for idx in idxs:
+            stock = float(out.at[idx, "stock"] or 0)
+            need = float(out.at[idx, "recommended_order"] or 0)
+            ads = float(out.at[idx, "avg_daily_sales"] or 0)
+            cover = float(out.at[idx, "cover_days"] or 0)
+            sales = float(out.at[idx, "sales_qty"] or 0)
+            quantum = int(out.at[idx, "quantum"] if "quantum" in out.columns else 1) or 1
+            if need > 0:
+                continue
+            surplus = _surplus_qty(stock, ads, over_days)
+            # Классическая перетарка по покрытию или «зависший» остаток без продаж.
+            is_over = (sales > 0 and cover > over_days) or (sales <= 0 and stock > 0)
+            if not is_over or surplus < quantum:
+                continue
+            sources.append((surplus, idx))
+
+        if not sources:
+            continue
+        sources.sort(key=lambda t: (-t[0], safe_str(out.at[t[1], "store"]).casefold()))
+
+        # Получатели: потребность по продажам или нулевой остаток без оценки.
+        dests: List[Tuple[Tuple, int, str, float]] = []
+        for idx in idxs:
+            stock = float(out.at[idx, "stock"] or 0)
+            need = float(out.at[idx, "recommended_order"] or 0)
+            sales = float(out.at[idx, "sales_qty"] or 0)
+            ads = float(out.at[idx, "avg_daily_sales"] or 0)
+            rank = _rank_key(
+                safe_str(out.at[idx, "store"]),
+                sales,
+                float(out.at[idx, "sales_amount"] if "sales_amount" in out.columns else 0) or 0.0,
+            )
+            if sales > 0 and need > 0:
+                dests.append((rank, idx, "по продажам получателя", need))
+            elif stock <= 0 and sales <= 0 and ads <= 0:
+                dests.append((rank, idx, "по кванту (нет оценки спроса)", 0.0))
+
+        if not dests:
+            continue
+        dests.sort(key=lambda t: t[0])
+
+        # Доступный остаток на отдачу по строкам-источникам.
+        available: Dict[int, float] = {idx: float(surplus) for surplus, idx in sources}
+
+        for rank_i, (rank_key, dest_idx, reason, need_sales) in enumerate(dests, start=1):
+            dest_need = float(out.at[dest_idx, "recommended_order"] or 0)
+            quantum = int(out.at[dest_idx, "quantum"] if "quantum" in out.columns else 1) or 1
+
+            if reason.startswith("по кванту"):
+                target_qty = float(quantum)
+            else:
+                target_qty = max(0.0, dest_need)
+                if target_qty <= 0:
+                    continue
+
+            remaining_need = target_qty
+            for src_idx in [i for _, i in sources]:
+                if remaining_need <= 0:
+                    break
+                avail = float(available.get(src_idx, 0) or 0)
+                if avail < quantum:
+                    continue
+                if reason.startswith("по кванту"):
+                    qty = float(quantum) if avail >= quantum else 0.0
+                else:
+                    qty = quantum_floor_qty(min(avail, remaining_need), quantum)
+                if qty <= 0:
+                    continue
+
+                from_stock_before = float(out.at[src_idx, "stock"] or 0)
+                to_stock_before = float(out.at[dest_idx, "stock"] or 0)
+                from_cover_before = float(out.at[src_idx, "cover_days"] or 0)
+
+                available[src_idx] = avail - qty
+                remaining_need -= qty
+
+                out.at[dest_idx, "transfer_in"] = float(out.at[dest_idx, "transfer_in"] or 0) + qty
+                out.at[dest_idx, "stock"] = to_stock_before + qty
+                if not reason.startswith("по кванту"):
+                    new_need = max(0.0, float(out.at[dest_idx, "recommended_order"] or 0) - qty)
+                    out.at[dest_idx, "recommended_order"] = new_need
+                # При переносе «по кванту» заказ (если был только min_stock) тоже снижаем.
+                elif float(out.at[dest_idx, "recommended_order"] or 0) > 0:
+                    out.at[dest_idx, "recommended_order"] = max(
+                        0.0, float(out.at[dest_idx, "recommended_order"] or 0) - qty
+                    )
+
+                out.at[src_idx, "transfer_out"] = float(out.at[src_idx, "transfer_out"] or 0) + qty
+                out.at[src_idx, "stock"] = from_stock_before - qty
+
+                # Пересчёт заказа у источника после списания (обычно 0, но min_stock может появиться).
+                src_stock = float(out.at[src_idx, "stock"] or 0)
+                src_need_base = float(out.at[src_idx, "need"] if "need" in out.columns else 0) or 0.0
+                raw = max(0.0, src_need_base - src_stock)
+                min_gap = max(0.0, min_stock_target - src_stock) if min_stock_target > 0 else 0.0
+                blocked = bool(out.at[src_idx, "order_blocked"]) if "order_blocked" in out.columns else False
+                if blocked:
+                    src_order = min_gap
+                else:
+                    src_order = max(raw, min_gap)
+                if round_up and src_order > 0:
+                    src_order = float(math.ceil(src_order))
+                out.at[src_idx, "recommended_order"] = src_order
+
+                transfers.append(
+                    {
+                        "from_store": safe_str(out.at[src_idx, "store"]),
+                        "to_store": safe_str(out.at[dest_idx, "store"]),
+                        "priority_rank": rank_i,
+                        "sku": safe_str(out.at[dest_idx, "sku"]),
+                        "sku_key": sku_key,
+                        "name": safe_str(out.at[dest_idx, "name"]),
+                        "barcode": safe_str(out.at[dest_idx, "barcode"] if "barcode" in out.columns else ""),
+                        "uom": safe_str(out.at[dest_idx, "uom"] if "uom" in out.columns else ""),
+                        "quantum": quantum,
+                        "transfer_qty": qty,
+                        "need_before": need_sales if not reason.startswith("по кванту") else float(quantum),
+                        "to_stock_before": to_stock_before,
+                        "from_stock_before": from_stock_before,
+                        "from_stock_after": float(out.at[src_idx, "stock"] or 0),
+                        "from_cover_before": from_cover_before,
+                        "order_after": float(out.at[dest_idx, "recommended_order"] or 0),
+                        "sales_qty": float(out.at[dest_idx, "sales_qty"] or 0),
+                        "reason": reason,
+                        "supplier_name": safe_str(
+                            out.at[dest_idx, "supplier_name"] if "supplier_name" in out.columns else ""
+                        ),
+                        "purchase_price": float(
+                            out.at[dest_idx, "purchase_price"] if "purchase_price" in out.columns else 0
+                        )
+                        or 0.0,
+                        "alt_supplier": safe_str(
+                            out.at[dest_idx, "alt_supplier"] if "alt_supplier" in out.columns else ""
+                        ),
+                    }
+                )
+
+                # Для режима «по кванту» — не больше одного кванта на пару SKU×получатель.
+                if reason.startswith("по кванту"):
+                    break
+
+    if "avg_daily_sales" in out.columns:
+        out["cover_days"] = np.where(
+            out["avg_daily_sales"] > 0,
+            out["stock"] / out["avg_daily_sales"],
+            np.where(out["stock"] > 0, 9999.0, 0.0),
+        )
+    out["order_need_flag"] = out["recommended_order"] > 0
+
+    transfers_df = pd.DataFrame(transfers) if transfers else empty
+    if not transfers_df.empty:
+        transfers_df = transfers_df.sort_values(
+            ["sku_key", "priority_rank", "from_store", "to_store"],
+            ascending=[True, True, True, True],
+        ).reset_index(drop=True)
+
+    logger.info(
+        "Перемещения магазин→магазин: строк=%s, qty=%s",
+        len(transfers_df),
+        float(transfers_df["transfer_qty"].sum()) if not transfers_df.empty else 0.0,
+    )
+    return out, transfers_df

@@ -16,7 +16,10 @@ from calculations.quantum_orders import (
 )
 from calculations.reorder import apply_reorder_logic
 from calculations.risk_analysis import apply_risk_analysis
-from calculations.transfers import apply_central_warehouse_transfers
+from calculations.transfers import (
+    apply_central_warehouse_transfers,
+    apply_store_to_store_transfers,
+)
 from config.settings import SETTINGS
 from data.merge import GRAIN_NETWORK, GRAIN_STORE, build_product_frame, filter_sales_by_period
 from data.store_utils import has_retail_store_dimension, has_store_dimension
@@ -122,11 +125,13 @@ def run_calculations(
     df = attach_quantum_column(df)
     df = round_orders_to_quantum(df, "recommended_order")
 
-    # Поставщик/цена → перемещения квантами с ЦС → заказ на ЦС = сумма магазинов → риски.
+    # Поставщик/цена → ЦС→магазин → магазин→магазин → заказ на ЦС = сумма магазинов → риски.
     df = attach_supplier_attributes(df)
     transfers_df = None
+    store_transfers_df = None
     if requested_grain == GRAIN_STORE:
         df, transfers_df = apply_central_warehouse_transfers(df)
+        df, store_transfers_df = apply_store_to_store_transfers(df)
         df = round_orders_to_quantum(df, "recommended_order")
         df = apply_central_supplier_order_from_stores(df)
     else:
@@ -168,6 +173,16 @@ def run_calculations(
     transfer_qty = (
         float(transfers_df["transfer_qty"].sum())
         if transfers_df is not None and not transfers_df.empty
+        else 0.0
+    )
+    store_transfer_lines = (
+        int(len(store_transfers_df))
+        if store_transfers_df is not None and not store_transfers_df.empty
+        else 0
+    )
+    store_transfer_qty = (
+        float(store_transfers_df["transfer_qty"].sum())
+        if store_transfers_df is not None and not store_transfers_df.empty
         else 0.0
     )
 
@@ -217,8 +232,11 @@ def run_calculations(
             "transfer_lines": transfer_lines,
             "transfer_qty_total": transfer_qty,
             "transfers": transfers_df,
+            "store_transfer_lines": store_transfer_lines,
+            "store_transfer_qty_total": store_transfer_qty,
+            "store_transfers": store_transfers_df,
             "quantum_enabled": True,
-            "release": "4",
+            "release": "5",
         }
     )
     logger.info(
