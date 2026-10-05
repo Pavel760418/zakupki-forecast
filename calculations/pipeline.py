@@ -8,6 +8,7 @@ from typing import Any, Dict, Tuple
 import pandas as pd
 
 from calculations.abc_analysis import apply_abc_analysis
+from calculations.flagman_analog import apply_flagman_analog
 from calculations.forecasting import apply_forecast_metrics
 from calculations.quantum_orders import (
     apply_central_supplier_order_from_stores,
@@ -122,6 +123,8 @@ def run_calculations(
         uplift=uplift_coefficient,
         downlift=downlift_coefficient,
     )
+    if requested_grain == GRAIN_STORE:
+        df = apply_flagman_analog(df)
     df = attach_quantum_column(df)
     df = round_orders_to_quantum(df, "recommended_order")
 

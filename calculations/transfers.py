@@ -23,6 +23,7 @@ from data.store_utils import (
     UNKNOWN_STORE_LABEL,
     canon_store_name,
     is_central_warehouse,
+    is_flagman_analog_store,
 )
 from utils.helpers import safe_str
 
@@ -117,6 +118,8 @@ def apply_central_warehouse_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, p
         if available <= 0:
             continue
         demand = out.index[retail_mask & (out["sku_key"] == sku_key) & (out["order_before_transfer"] > 0)].tolist()
+        # Лига Химки и Сколково: чужой склад в их потребность не входит.
+        demand = [idx for idx in demand if not is_flagman_analog_store(out.at[idx, "store"])]
         if not demand:
             continue
 
@@ -328,6 +331,8 @@ def apply_store_to_store_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
         # Источники: избыток / нет продаж при остатке; сами не нуждаются в заказе.
         sources: List[Tuple[float, int]] = []
         for idx in idxs:
+            if is_flagman_analog_store(out.at[idx, "store"]):
+                continue
             stock = float(out.at[idx, "stock"] or 0)
             need = float(out.at[idx, "recommended_order"] or 0)
             ads = float(out.at[idx, "avg_daily_sales"] or 0)
@@ -350,6 +355,8 @@ def apply_store_to_store_transfers(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
         # Получатели: потребность по продажам или нулевой остаток без оценки.
         dests: List[Tuple[Tuple, int, str, float]] = []
         for idx in idxs:
+            if is_flagman_analog_store(out.at[idx, "store"]):
+                continue
             stock = float(out.at[idx, "stock"] or 0)
             need = float(out.at[idx, "recommended_order"] or 0)
             sales = float(out.at[idx, "sales_qty"] or 0)

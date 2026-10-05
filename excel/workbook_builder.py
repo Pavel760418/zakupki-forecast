@@ -29,7 +29,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from config.settings import OUTPUT_DIR, SETTINGS
 from data.merge import GRAIN_STORE
-from data.store_utils import NETWORK_STORE_LABEL, is_central_warehouse
+from data.store_utils import NETWORK_STORE_LABEL, is_central_warehouse, is_flagman_analog_store
 from excel.formatting import (
     ALIGN_CENTER,
     ALIGN_WRAP,
@@ -241,6 +241,12 @@ def _build_instruction(
             False,
             11,
         ),
+        (
+            "«Лига», «Химки» и «Лига Химки» — один магазин «Лига Химки». "
+            "Сколково — отдельная точка. Пока своих продаж мало, заказ этих точек = потребность Флагмана минус свой остаток.",
+            False,
+            11,
+        ),
     ]
     if supplier_name and safe_str(supplier_name).strip():
         lines.append(
@@ -340,6 +346,8 @@ def _build_settings(wb: Workbook, meta: Dict[str, Any]) -> None:
          "Докупка заказа до этого уровня по каждому SKU (даже при нулевом остатке / низких продажах)"),
         (21, "Дата начала периода", str(meta.get("date_from", ""))[:10], "Информативно"),
         (22, "Дата окончания периода", str(meta.get("date_to", ""))[:10], "Информативно"),
+        (23, "Доля своих продаж к Флагману", SETTINGS.get("analog_sales_share_max", 1.0),
+         "Допущение: Лига Химки и Сколково берут прогноз Флагмана, пока свои продажи SKU ниже этой доли продаж Флагмана"),
     ]
 
     for r, a, b, c in rows:
@@ -351,18 +359,23 @@ def _build_settings(wb: Workbook, meta: Dict[str, Any]) -> None:
             for col in range(1, 4):
                 ws.cell(row=r, column=col).fill = FILL_HEADER
                 ws.cell(row=r, column=col).font = FONT_HEADER
-        elif r <= 20:
+        elif r <= 20 or r == 23:
             cell_b.fill = FILL_EDIT
-            cell_b.comment = Comment(c, "Система", width=200, height=50)
+            cell_b.comment = Comment(c, "Система", width=220, height=60)
 
     ws.column_dimensions["A"].width = 32
     ws.column_dimensions["B"].width = 18
     ws.column_dimensions["C"].width = 45
 
-    ws["A24"] = "Справка по формулам"
-    ws["A24"].font = Font(bold=True, size=12, color="1F4E79")
-    ws["A25"] = "Прогноз = (Продажи/B5)*B6*Тренд*B7*B8*B9*МножABC*КоэфСтроки"
-    ws["A26"] = "Заказ = MAX(расчётный; MAX(0; B20 - Остаток)) - докупка до минимального остатка"
+    ws["A25"] = "Справка по формулам"
+    ws["A25"].font = Font(bold=True, size=12, color="1F4E79")
+    ws["A26"] = "Прогноз = (Продажи/B5)*B6*Тренд*B7*B8*B9*МножABC*КоэфСтроки"
+    ws["A27"] = "Заказ = MAX(расчётный; MAX(0; B20 - Остаток)) - докупка до минимального остатка"
+    ws["A28"] = (
+        "Лига Химки и Сколково: если свои продажи SKU ниже доли B23 от Флагмана, "
+        "среднедневные и прогноз берутся с Флагмана, заказ = потребность Флагмана − свой остаток. "
+        "Чужой склад и перемещения между магазинами для этих точек не используются."
+    )
 
 
 def _build_dashboard(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> None:
@@ -547,6 +560,9 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
     coef_l = _col_letter("line_coef")
     avg_l = _col_letter("avg_daily")
     fc_l = _col_letter("forecast")
+    store_l = _col_letter("store")
+    sku_l = _col_letter("sku")
+    data_last = len(df) + 2
     sf_l = _col_letter("safety")
     need_l = _col_letter("need")
     raw_l = _col_letter("raw_order")
@@ -582,23 +598,44 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
 
         # Заказ: базовая формула, затем округление вверх до кванта (столбец quantum).
         q_l = _col_letter("quantum")
+        store_name = safe_str(row.get("store", ""))
         base_order = (
             f"MAX(IF(AND({sales_l}{r}<=0,{trend_l}{r}<=1),0,MAX(0,CEILING({raw_l}{r},1))),"
             f"MAX(0,CEILING('01_Настройки'!$B$20-{stock_l}{r},1)))"
         )
-        ws.cell(row=r, column=COL["avg_daily"], value=f"=IF('01_Настройки'!$B$5=0,0,{sales_l}{r}/'01_Настройки'!$B$5)")
+        avg_formula = f"=IF('01_Настройки'!$B$5=0,0,{sales_l}{r}/'01_Настройки'!$B$5)"
+        trend_expr = trend_l + str(r)
+        if is_flagman_analog_store(store_name) and data_last >= 3:
+            flag_sales = (
+                f'SUMIFS(${sales_l}$3:${sales_l}${data_last},${store_l}$3:${store_l}${data_last},"Флагман",'
+                f'${sku_l}$3:${sku_l}${data_last},{sku_l}{r})'
+            )
+            flag_trend = (
+                f'SUMIFS(${trend_l}$3:${trend_l}${data_last},${store_l}$3:${store_l}${data_last},"Флагман",'
+                f'${sku_l}$3:${sku_l}${data_last},{sku_l}{r})'
+            )
+            use_analog = (
+                f'OR({sales_l}{r}<=0,AND({flag_sales}>0,{sales_l}{r}<\'01_Настройки\'!$B$23*{flag_sales}))'
+            )
+            avg_formula = (
+                f'=IF({use_analog},IF(\'01_Настройки\'!$B$5=0,0,{flag_sales}/\'01_Настройки\'!$B$5),'
+                f'IF(\'01_Настройки\'!$B$5=0,0,{sales_l}{r}/\'01_Настройки\'!$B$5))'
+            )
+            trend_expr = f'IF({use_analog},IF({flag_trend}=0,1,{flag_trend}),{trend_l}{r})'
+            analog_base = f"MAX(0,CEILING({need_l}{r}-{stock_l}{r},1))"
+            base_order = f'IF({use_analog},{analog_base},{base_order})'
+        ws.cell(row=r, column=COL["avg_daily"], value=avg_formula)
         ws.cell(
             row=r,
             column=COL["forecast"],
             value=(
-                f"={avg_l}{r}*'01_Настройки'!$B$6*{trend_l}{r}*'01_Настройки'!$B$7*"
+                f"={avg_l}{r}*'01_Настройки'!$B$6*({trend_expr})*'01_Настройки'!$B$7*"
                 f"'01_Настройки'!$B$8*'01_Настройки'!$B$9*{_abc_mult_formula(r)}*{coef_l}{r}"
             ),
         )
-        ws.cell(row=r, column=COL["safety"], value=f"={avg_l}{r}*{_safety_days_formula(r)}*{trend_l}{r}")
+        ws.cell(row=r, column=COL["safety"], value=f"={avg_l}{r}*{_safety_days_formula(r)}*({trend_expr})")
         ws.cell(row=r, column=COL["need"], value=f"={fc_l}{r}+{sf_l}{r}")
         ws.cell(row=r, column=COL["raw_order"], value=f"={need_l}{r}-{stock_l}{r}")
-        store_name = safe_str(row.get("store", ""))
         if is_central_warehouse(store_name) and float(row.get("supplier_order_qty", 0) or 0) > 0:
             # Заказ на ЦС = сумма потребности магазинов (считается в модуле), не локальная формула.
             rec_cell = ws.cell(
@@ -630,7 +667,10 @@ def _build_main_calc(wb: Workbook, df: pd.DataFrame, meta: Dict[str, Any]) -> No
         note = ws.cell(row=r, column=COL["note"], value="")
         tin = float(row.get("transfer_in", 0) or 0)
         tout = float(row.get("transfer_out", 0) or 0)
-        if tin > 0:
+        analog_note = safe_str(row.get("analog_note", ""))
+        if analog_note:
+            note.value = analog_note
+        elif tin > 0:
             note.value = f"Переместить на точку: +{tin:g}"
         elif tout > 0:
             note.value = f"Списать со склада: −{tout:g}"

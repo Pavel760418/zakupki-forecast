@@ -34,7 +34,16 @@ STORE_CANON = {
     "сочи приморская": "Сочи Приморская",
     "сочи": "Сочи Приморская",
     "флагман": "Флагман",
+    # Длинное имя раньше коротких: иначе подстрока «лига» разрежет «Лига Химки».
+    "лига химки": "Лига Химки",
+    "лига": "Лига Химки",
+    "химки": "Лига Химки",
+    "сколково": "Сколково",
 }
+
+# Новые точки формата Флагман: при слабой своей истории прогноз берётся с него.
+BENCHMARK_STORE = "Флагман"
+FLAGMAN_ANALOG_STORES = frozenset({"Лига Химки", "Сколково"})
 
 _PREFIX_RE = re.compile(
     r"^(обособленное подразделение|основное подразделение)\s+",
@@ -58,7 +67,8 @@ def canon_store_name(value: object) -> str:
         return ""
     if key in STORE_CANON:
         return STORE_CANON[key]
-    for alias, canon in STORE_CANON.items():
+    # Сначала длинные алиасы («лига химки», «сочи приморская»), потом короткие.
+    for alias, canon in sorted(STORE_CANON.items(), key=lambda item: len(item[0]), reverse=True):
         if alias in key:
             return canon
     cleaned = _PREFIX_RE.sub("", raw).strip()
@@ -68,6 +78,11 @@ def canon_store_name(value: object) -> str:
 def store_key(value: object) -> str:
     name = canon_store_name(value)
     return name.casefold() if name else ""
+
+
+def is_flagman_analog_store(value: object) -> bool:
+    """Лига Химки и Сколково: заказ от аналога Флагмана, без чужого склада и без перемещений."""
+    return canon_store_name(value) in FLAGMAN_ANALOG_STORES
 
 
 def is_central_warehouse(value: object) -> bool:
